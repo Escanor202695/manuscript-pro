@@ -470,11 +470,14 @@ async def translate_document(request: TranslateRequest):
     except Exception as e:
         print(f"[TRANSLATE] Error: {str(e)}")
         import traceback
-        traceback.print_exc()
+        error_trace = traceback.format_exc()
+        print(f"[TRANSLATE] Full traceback:\n{error_trace}")
         # Mark progress as failed
         if request.progressId and request.progressId in progress_tracker:
             progress_tracker[request.progressId]["error"] = True
-        raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
+        # Include more details in error response
+        error_detail = f"Translation failed: {str(e)}\n\nTraceback:\n{error_trace}"
+        raise HTTPException(status_code=500, detail=error_detail)
 
 
 @app.post("/api/translate/enhanced", response_model=TranslateResponse)
@@ -1192,7 +1195,22 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
     import json
     
     print(f"[TRANSLATOR] Initializing Gemini client")
-    client = genai.Client(api_key=api_key)
+    print(f"[TRANSLATOR] Model: {model}, API Key present: {bool(api_key)}")
+    
+    # Normalize model name - Google Genai SDK accepts model names as-is
+    # But we'll log it for debugging
+    normalized_model = model.strip()
+    print(f"[TRANSLATOR] Using model: {normalized_model}")
+    
+    try:
+        client = genai.Client(api_key=api_key)
+        print(f"[TRANSLATOR] Client initialized successfully")
+    except Exception as e:
+        error_msg = f"Failed to initialize Gemini client: {str(e)}"
+        print(f"[TRANSLATOR ERROR] {error_msg}")
+        import traceback
+        traceback.print_exc()
+        raise Exception(error_msg)
     
     # Load document
     doc = Document(io.BytesIO(file_bytes))
@@ -1209,8 +1227,12 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
     logs.append(f"[INFO] Source file: {file_name}")
     logs.append(f"[INFO] Document has {len(paragraphs)} total paragraphs")
     logs.append(f"[INFO] Using ADAPTIVE TOKEN-BASED BATCHING - maximizes efficiency while preserving formatting")
-    logs.append(f"[INFO] Using Gemini model: {model}")
+    logs.append(f"[INFO] Using Gemini model: {normalized_model}")
     logs.append(f"[INFO] Processing in memory - no files saved to disk")
+    
+    # Use normalized_model for all API calls in this function
+    # Replace model variable with normalized_model for consistency
+    model = normalized_model
     
     # Prepare paragraph batches with TOKEN-BASED ADAPTIVE BATCHING
     paragraph_batches = []
@@ -1241,7 +1263,7 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
             continue
 
         word_count = len(original.strip().split())
-        is_heading = para.style.name.lower().startswith("heading") or para.alignment == 1
+        is_heading = (para.style is not None and para.style.name.lower().startswith("heading")) or para.alignment == 1
 
         # Skip single-word non-heading paragraphs
         if word_count <= 1:
@@ -1703,7 +1725,7 @@ async def translate_document_content_async_openrouter(file_bytes: bytes, file_na
             continue
 
         word_count = len(original.strip().split())
-        is_heading = para.style.name.lower().startswith("heading") or para.alignment == 1
+        is_heading = (para.style is not None and para.style.name.lower().startswith("heading")) or para.alignment == 1
 
         # Skip single-word non-heading paragraphs
         if word_count <= 1:

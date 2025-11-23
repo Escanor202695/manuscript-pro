@@ -315,7 +315,15 @@ class RobustFormatPreserver:
         # Apply paragraph formatting
         para_format = para_data['format']
         if para_format.get('style'):
-            para.style = para_format['style']
+            style_name = para_format['style']
+            try:
+                # Try to set the style, but handle case where style doesn't exist in document
+                para.style = style_name
+            except (KeyError, ValueError) as e:
+                # Style doesn't exist in document - skip style assignment but continue with other formatting
+                # This can happen if the document doesn't have the style in its style collection
+                # The paragraph will keep its default style
+                pass
         if para_format.get('alignment') is not None:
             para.alignment = para_format['alignment']
         if para_format.get('left_indent') is not None:
