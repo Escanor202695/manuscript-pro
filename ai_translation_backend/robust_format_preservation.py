@@ -161,29 +161,123 @@ class RobustFormatPreserver:
             tab_stops=tab_stops
         )
     
+    def _get_format_signature(self, run_format: RunFormatting) -> tuple:
+        """Create a format signature for comparison (excludes text)"""
+        return (
+            run_format.bold,
+            run_format.italic,
+            run_format.underline,
+            run_format.strike,
+            run_format.double_strike,
+            run_format.subscript,
+            run_format.superscript,
+            run_format.font_name,
+            run_format.font_size,
+            run_format.font_color,
+            run_format.highlight_color,
+            run_format.all_caps,
+            run_format.small_caps,
+            run_format.shadow,
+            run_format.emboss,
+            run_format.imprint,
+            run_format.outline,
+            run_format.character_spacing,
+            run_format.position
+        )
+    
+    def _merge_runs_with_same_formatting(self, para: Paragraph) -> List[Dict]:
+        """
+        Merge consecutive runs that have identical formatting.
+        This dramatically reduces run count while preserving exact spacing.
+        CRITICAL: run.text already contains spaces, so concatenation preserves spacing perfectly.
+        """
+        if not para.runs:
+            return []
+        
+        merged_groups = []
+        current_group = {
+            'runs': [],
+            'run_indices': [],  # Track indices to avoid index() lookup issues
+            'text': '',
+            'format': None,
+            'format_obj': None
+        }
+        
+        # Track indices as we iterate to avoid index() lookup issues
+        for idx, run in enumerate(para.runs):
+            run_format = self.extract_run_formatting(run)
+            format_sig = self._get_format_signature(run_format)
+            
+            # Check if this run has the same formatting as current group
+            if current_group['format'] is None:
+                # First run - start new group
+                current_group['runs'] = [run]
+                current_group['run_indices'] = [idx]
+                current_group['text'] = run.text  # Includes spaces!
+                current_group['format'] = format_sig
+                current_group['format_obj'] = run_format
+            elif format_sig == current_group['format']:
+                # Same formatting - merge into current group
+                # CRITICAL: run.text already contains spaces, so concatenation preserves spacing
+                current_group['runs'].append(run)
+                current_group['run_indices'].append(idx)
+                current_group['text'] += run.text  # Spaces preserved automatically!
+            else:
+                # Different formatting - save current group and start new one
+                merged_groups.append(current_group)
+                current_group = {
+                    'runs': [run],
+                    'run_indices': [idx],
+                    'text': run.text,
+                    'format': format_sig,
+                    'format_obj': run_format
+                }
+        
+        # Add the last group
+        if current_group['runs']:
+            merged_groups.append(current_group)
+        
+        return merged_groups
+    
     def create_formatted_text_for_translation(self, para: Paragraph, para_id: int) -> Tuple[str, Dict]:
-        """Create marked text for translation with 100% format preservation"""
+        """
+        Create marked text for translation with 100% format preservation.
+        OPTIMIZED: Merges runs with identical formatting to reduce complexity and preserve exact spacing.
+        
+        Key insight: run.text already contains spaces, so merging by concatenation preserves spacing perfectly.
+        This fixes the issue where many small runs cause spacing problems.
+        """
         para_format = self.extract_paragraph_formatting(para)
         runs_data = []
         marked_text = ""
         
-        for i, run in enumerate(para.runs):
-            run_format = self.extract_run_formatting(run)
+        # OPTIMIZATION: Merge consecutive runs with identical formatting
+        # This dramatically reduces run count while preserving exact spacing
+        # Since run.text already contains spaces, concatenation preserves spacing automatically
+        merged_groups = self._merge_runs_with_same_formatting(para)
+        
+        # Process each merged group
+        for group in merged_groups:
+            run_format = group['format_obj']
+            merged_text = group['text']  # Already includes all spaces from original runs!
+            original_run_indices = group['run_indices']  # Use pre-tracked indices
+            
+            # Create unique marker for this merged run
             run_id = self.run_counter
             self.run_counter += 1
-            
-            # Create unique marker
             marker = run_format.to_marker(run_id)
             
             # Add to marked text
-            marked_text += f"{marker}{run.text}««/RUN{run_id}»»"
+            marked_text += f"{marker}{merged_text}««/RUN{run_id}»»"
             
-            # Store complete formatting data
+            # Store complete formatting data with merge info
             runs_data.append({
                 'id': run_id,
                 'format': asdict(run_format),
-                'original_text': run.text,
-                'marker': marker
+                'original_text': merged_text,
+                'marker': marker,
+                'merged_from_runs': original_run_indices,  # Track which runs were merged
+                'is_merged': len(group['runs']) > 1
             })
         
         # Store complete paragraph data
@@ -192,7 +286,9 @@ class RobustFormatPreserver:
             'format': asdict(para_format),
             'runs': runs_data,
             'marked_text': marked_text,
-            'checksum': hashlib.md5(marked_text.encode()).hexdigest()
+            'checksum': hashlib.md5(marked_text.encode()).hexdigest(),
+            'original_run_count': len(para.runs),  # Track original count
+            'merged_run_count': len(merged_groups)  # Track merged count
         }
         
         self.format_map[para_id] = para_data
@@ -278,17 +374,16 @@ class RobustFormatPreserver:
     
     def apply_formatting_to_paragraph(self, para: Paragraph, para_id: int, translated_text: str):
         """Apply all formatting to translated paragraph"""
-        # CRITICAL: Remove delimiter markers first (before any processing)
-        translated_text = re.sub(r'<<<TRANSLATION_\d+_START>>>', '', translated_text)
-        translated_text = re.sub(r'<<<TRANSLATION_\d+_END>>>', '', translated_text)
+        # CRITICAL: Remove ALL delimiter markers first (catches any variations including translated/misspelled ones)
+        # Remove any text between <<< and >>> (comprehensive removal)
+        translated_text = re.sub(r'<<<[^>]*?>>>', '', translated_text, flags=re.DOTALL)
         
         para_data = self.format_map.get(para_id)
         if not para_data:
             # No format data - remove any markers and set plain text
             clean_text = re.sub(r'««[^»]+»»', '', translated_text)
-            # Remove any remaining delimiter markers
-            clean_text = re.sub(r'<<<TRANSLATION_\d+_START>>>', '', clean_text)
-            clean_text = re.sub(r'<<<TRANSLATION_\d+_END>>>', '', clean_text)
+            # Remove any remaining delimiter markers (comprehensive removal)
+            clean_text = re.sub(r'<<<[^>]*?>>>', '', clean_text, flags=re.DOTALL)
             for run in para.runs:
                 run.text = ""
             if para.runs:
@@ -305,8 +400,8 @@ class RobustFormatPreserver:
             if 'text' in run_data:
                 # Remove any remaining markers from the text (both robust and delimiter markers)
                 run_data['text'] = re.sub(r'««[^»]+»»', '', run_data['text'])
-                run_data['text'] = re.sub(r'<<<TRANSLATION_\d+_START>>>', '', run_data['text'])
-                run_data['text'] = re.sub(r'<<<TRANSLATION_\d+_END>>>', '', run_data['text'])
+                # Remove ALL delimiter markers (comprehensive removal - catches any variations)
+                run_data['text'] = re.sub(r'<<<[^>]*?>>>', '', run_data['text'], flags=re.DOTALL)
         
         # Clear existing runs
         for run in para.runs:
@@ -417,6 +512,177 @@ def create_robust_translation_prompt(marked_texts: List[Tuple[int, str]], langua
 
 Translate the following {len(marked_texts)} passages into {language} with ABSOLUTE format preservation.
 
+🎯 CRITICAL: READING LEVEL & MODERNIZATION REQUIREMENT:
+
+**8TH GRADE READING LEVEL - MANDATORY:**
+- Translate ALL text to modern, contemporary language suitable for 8th grade reading level (ages 13-14)
+- This applies to ALL target languages, including English-to-English translation
+
+**🔴 ENGLISH-TO-ENGLISH MODERNIZATION - ABSOLUTELY REQUIRED:**
+- When target language is "English" or "Contemporary English", you MUST still translate/modernize the text
+- DO NOT leave text unchanged just because it's already in English
+- You MUST modernize old/archaic English to contemporary English
+- You MUST simplify complex language to 8th grade level
+- You MUST replace formal/old-fashioned words with modern equivalents
+- Even if the text looks "modern", you MUST ensure it's at 8th grade reading level
+- This is NOT optional - English-to-English still requires active translation work
+- Every word and sentence must be reviewed and modernized if needed
+
+**MODERNIZATION REQUIREMENTS:**
+- If source text is in old/archaic English, modernize it to contemporary English
+- Use simple, clear, everyday language that common people can easily understand
+- Replace formal academic language with conversational language
+- Replace complex vocabulary with simpler 8th grade level words
+- Replace archaic words with modern equivalents:
+  * "thou/thee/thy" → "you/your"
+  * "hath/hast" → "has/have"
+  * "doth" → "does"
+  * "art" → "are"
+  * "wilt" → "will"
+  * "hither/thither" → "here/there"
+  * "whence" → "from where"
+  * "whither" → "to where"
+  * "betwixt" → "between"
+  * "ere" → "before"
+  * "nigh" → "near"
+  * "oft" → "often"
+  * "perchance" → "perhaps"
+  * "verily" → "truly" or "really"
+  * "hence" → "therefore" or "so"
+  * "thus" → "so" or "in this way"
+  * "wherefore" → "why"
+  * "methinks" → "I think"
+  * "prithee" → "please"
+  * "anon" → "soon" or "later"
+- Simplify complex sentence structures into clear, straightforward sentences
+- Break up very long sentences into shorter, more readable ones
+- Use active voice instead of passive voice when possible
+- Replace formal/archaic expressions with modern, conversational equivalents
+- Maintain the meaning and tone, but make it accessible to modern readers
+- Even if translating to English, modernize old English to contemporary English
+
+**EXAMPLES - ENGLISH-TO-ENGLISH MODERNIZATION:**
+
+Example 1 - Archaic English:
+- Old: "Thou art a goodly fellow, methinks."
+- Modern: "I think you're a good person."
+- ❌ WRONG: Leaving it as "Thou art a goodly fellow, methinks." (unchanged)
+- ✅ CORRECT: Modernizing to "I think you're a good person."
+
+Example 2 - Archaic Questions:
+- Old: "Whence comest thou, and whither goest thou?"
+- Modern: "Where are you coming from, and where are you going?"
+- ❌ WRONG: Leaving it unchanged
+- ✅ CORRECT: Modernizing to contemporary English
+
+Example 3 - Formal/Old English:
+- Old: "Verily, I say unto thee, this matter doth concern us all."
+- Modern: "I'm telling you, this matter concerns all of us."
+- ❌ WRONG: Leaving it unchanged
+- ✅ CORRECT: Modernizing to conversational English
+
+Example 4 - Complex Academic English:
+- Old: "The aforementioned individual has demonstrated a propensity for engaging in activities that are not in accordance with established protocols."
+- Modern: "This person has a habit of doing things that break the rules."
+- ❌ WRONG: Leaving complex academic language unchanged
+- ✅ CORRECT: Simplifying to 8th grade level
+
+Example 5 - Old-Fashioned Formal English:
+- Old: "Hath he not spoken thus to thee ere this day?"
+- Modern: "Hasn't he said this to you before today?"
+- ❌ WRONG: Leaving it unchanged
+- ✅ CORRECT: Modernizing to contemporary English
+
+Example 6 - Even "Modern" English Needs Simplification:
+- Old: "The individual's cognitive processes were significantly impeded by the complexity of the situation."
+- Modern: "The person had trouble thinking because the situation was too complicated."
+- ❌ WRONG: Leaving complex academic language unchanged
+- ✅ CORRECT: Simplifying to 8th grade level
+
+**REMEMBER:**
+- When target is "English" or "Contemporary English", you MUST actively modernize
+- Do NOT copy text unchanged - always review and modernize
+- Every sentence must be checked for 8th grade readability
+- Complex words → Simple words
+- Formal language → Conversational language
+- Old English → Modern English
+
+**LINK / URL HANDLING - CRITICAL:**
+- REMOVE all hyperlinks, URLs, and link markup from the translation
+- If original text contains a URL (http://, https://, www., etc.) → OMIT it entirely
+- If original text contains Markdown links like `[text](url)` → Output ONLY the text, remove the `(url)`
+- If original text contains angle-bracket links `<http://...>` → Remove them completely
+- If original text contains HTML links `<a href="...">text</a>` → Output only the text, remove the href
+- If original contains "See here: https://..." → Translate "See here:" but REMOVE the URL
+- NEVER translate or preserve URLs or links – they must be removed
+- This prevents duplicated content and unnecessary link noise in the translation
+
+🚫 CRITICAL: NO HALLUCINATION - EXACT LINE & CONTENT PRESERVATION:
+
+**MANDATORY - ZERO HALLUCINATION POLICY:**
+- DO NOT add any content that is not in the original text
+- DO NOT remove any content from the original text
+- DO NOT add extra sentences, explanations, or commentary
+- DO NOT summarize or condense the text
+- DO NOT expand or elaborate on the text
+- Translate sentence-by-sentence, maintaining exact sentence count
+- If original has 5 lines → translation MUST have exactly 5 lines
+- If original has 10 sentences → translation MUST have exactly 10 sentences
+- Count lines before translating and ensure your translation has the SAME number of lines
+- Count sentences before translating and ensure your translation has the SAME number of sentences
+
+**LINE COUNT PRESERVATION - ABSOLUTE REQUIREMENT:**
+- Count the number of lines in the original passage (lines separated by \\n)
+- Your translation MUST have the EXACT same number of lines
+- Example: If original has 5 lines:
+  Line 1: "Hello"
+  Line 2: "How are you?"
+  Line 3: "I am fine."
+  Line 4: "Thank you."
+  Line 5: "Goodbye"
+  
+  Translation MUST also have exactly 5 lines:
+  Line 1: [translation of line 1]
+  Line 2: [translation of line 2]
+  Line 3: [translation of line 3]
+  Line 4: [translation of line 4]
+  Line 5: [translation of line 5]
+  
+- DO NOT combine lines into one
+- DO NOT split one line into multiple lines
+- DO NOT add blank lines
+- DO NOT remove blank lines
+- If original has a blank line, translation must have a blank line in the same position
+
+**SENTENCE COUNT PRESERVATION:**
+- Count the number of sentences in the original (sentences end with . ! ?)
+- Your translation MUST have the EXACT same number of sentences
+- Translate each sentence independently - do not combine or split sentences
+- If original has 3 sentences, translation must have 3 sentences
+- DO NOT add explanatory sentences
+- DO NOT add transitional phrases that weren't in the original
+- DO NOT remove sentences or combine them
+
+**CONTENT FIDELITY:**
+- Translate ONLY what is written - nothing more, nothing less
+- If a sentence is unclear, translate it as written - do not "clarify" or "improve" it
+- Do not add context or background information
+- Do not add examples or explanations
+- Do not add connecting words or phrases that weren't in the original
+- Maintain the exact structure: if original is terse, translation should be terse
+- Maintain the exact structure: if original is verbose, translation should be verbose
+
+**ANTI-HALLUCINATION CHECKLIST:**
+Before submitting your translation, verify:
+✓ Same number of lines as original
+✓ Same number of sentences as original
+✓ No added content
+✓ No removed content
+✓ No added explanations
+✓ No added examples
+✓ No added transitions
+✓ Exact 1:1 correspondence between original and translation
+
 🔴 CRITICAL FORMATTING RULES - 100% PRESERVATION REQUIRED:
 
 1. **RUN MARKERS ARE SACRED**:
@@ -424,6 +690,15 @@ Translate the following {len(marked_texts)} passages into {language} with ABSOLU
    - ««RUN1:I,U»»text««/RUN1»» = Run 1 with Italic+Underline
    - ««RUN2:F:Arial_Black,SZ:14,C:FF0000»»text««/RUN2»» = Custom font, size, color
    - NEVER modify, remove, or reorder these markers
+
+1.5. **OPTIMIZATION - MERGED RUNS**:
+   - Multiple consecutive runs with identical formatting have been merged into single runs
+   - This reduces complexity while preserving 100% of formatting and spacing
+   - Each run marker may represent one or more original runs with the same formatting
+   - CRITICAL: Spaces are already included in the run text - preserve them exactly
+   - Example: ««RUN25:PLAIN»»Oh, what must one often hear««/RUN25»» contains spaces between words
+   - Do NOT add or remove spaces - they are already correctly positioned in the text
+   - The merged text preserves exact spacing from the original document
 
 2. **FORMATTING CODES**:
    - B=Bold, I=Italic, U=Underline, S=Strike, DS=DoubleStrike
@@ -437,9 +712,14 @@ Translate the following {len(marked_texts)} passages into {language} with ABSOLU
 
 3. **TRANSLATION RULES**:
    - Translate ONLY the text between markers
-   - Maintain EXACT number of runs
+   - Maintain EXACT number of runs (runs may be merged, but count stays the same)
    - Keep run order: RUN0, RUN1, RUN2...
    - Preserve spacing and line breaks within runs
+   - CRITICAL: Spaces are ALREADY included in the run text - preserve them exactly as they appear
+   - Do NOT add extra spaces between words
+   - Do NOT remove spaces between words
+   - The text "Oh, what must one often hear" already has correct spacing - translate it maintaining the same spacing
+   - Each run's text contains the exact spacing from the original - translate word-by-word but keep spacing intact
 
 4. **PUNCTUATION PRESERVATION - CRITICAL**:
    - PRESERVE ALL punctuation marks EXACTLY as they appear

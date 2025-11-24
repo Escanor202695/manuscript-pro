@@ -433,7 +433,7 @@ async def translate_document(request: TranslateRequest):
         
         if use_robust is None and ROBUST_FORMATTING_AVAILABLE:
             # Auto-detect based on document complexity
-            doc = Document(io.BytesIO(file_bytes))
+            doc = load_document(file_bytes)
             
             # Count total runs and format variations
             total_runs = sum(len(para.runs) for para in doc.paragraphs if para.text.strip())
@@ -490,7 +490,7 @@ async def translate_document_enhanced_endpoint(request: TranslateRequest):
         file_bytes = base64.b64decode(request.fileData)
         
         # Analyze document complexity
-        doc = Document(io.BytesIO(file_bytes))
+        doc = load_document(file_bytes)
         total_runs = sum(len(para.runs) for para in doc.paragraphs if para.text.strip())
         total_paras = len([p for p in doc.paragraphs if p.text.strip()])
         avg_runs_per_para = total_runs / max(total_paras, 1)
@@ -721,6 +721,14 @@ def extract_drive_id(link: str) -> str:
     
     return link.strip()
 
+
+def load_document(file_bytes: bytes) -> Document:
+    """
+    Load a DOCX document from bytes and keep content unchanged.
+    """
+    doc = Document(io.BytesIO(file_bytes))
+    return doc
+
 def is_meaningful_text(text):
     """Check if text contains meaningful content"""
     cleaned = re.sub(r'[\W_]+', '', text)
@@ -731,8 +739,36 @@ def is_decorative_only(text):
     stripped = text.strip()
     return not stripped or re.fullmatch(r"[^\w\s]+", stripped) or re.fullmatch(r"[A-Z]", stripped)
 
+
+def preview_text(text: str, limit: int = 200) -> str:
+    """Create a sanitized preview of text for logging."""
+    if not text:
+        return ""
+    sanitized = text.replace("\n", "\\n")
+    if len(sanitized) > limit:
+        sanitized = sanitized[:limit] + "..."
+    return sanitized
+
+
+
+def remove_delimiter_markers(text: str) -> str:
+    """
+    Remove ALL delimiter markers in format <<<...>>> - catches any variations including translated/misspelled ones.
+    This ensures no delimiter markers (like <<<TRANULATION_1_END>>>) end up in the final document.
+    """
+    if not text:
+        return text
+    # Remove ANY text between <<< and >>> (catches all variations including translated markers)
+    # This pattern matches:
+    # - <<<TRANSLATION_1_START>>>
+    # - <<<TRANULATION_1_END>>> (translated/misspelled)
+    # - <<<TRANSLATION_START_1>>>
+    # - Any other <<<...>>> pattern
+    text = re.sub(r'<<<[^>]*?>>>', '', text, flags=re.DOTALL)
+    return text
+
 def sanitize_response(text: str) -> str:
-    """Remove AI artifacts but PRESERVE all whitespace."""
+    """Remove AI artifacts but PRESERVE all whitespace and robust formatting tags."""
     if not text:
         return text
     # Remove AI reasoning tags
@@ -742,11 +778,11 @@ def sanitize_response(text: str) -> str:
     # These should only come from our error handling, not from AI output
     text = re.sub(r'<untranslated>', '', text, flags=re.IGNORECASE)
     text = re.sub(r'</untranslated>', '', text, flags=re.IGNORECASE)
-    # Remove delimiter markers that might have leaked through
-    text = re.sub(r'<<<TRANSLATION_\d+_START>>>', '', text)
-    text = re.sub(r'<<<TRANSLATION_\d+_END>>>', '', text)
-    # Remove robust formatting markers that might have leaked through
-    text = re.sub(r'««[^»]+»»', '', text)
+    # Remove ALL delimiter markers (comprehensive removal - catches translated/misspelled variants)
+    text = remove_delimiter_markers(text)
+    # DO NOT remove robust formatting markers ««...»» - they need to be preserved!
+    # The robust formatter will parse and remove them when applying formatting to the document
+    # text = re.sub(r'««[^»]+»»', '', text)  # REMOVED - preserve robust formatting tags
     # Do NOT strip() - preserve all whitespace including indentation!
     return text
 
@@ -756,10 +792,32 @@ def create_format_marked_text(para) -> tuple:
     marked_text = ""
     format_map = []
     
+    # Get original paragraph text for space preservation
+    original_para_text = para.text
+    run_texts = [run.text for run in para.runs if run.text]
+    concatenated_runs = ''.join(run_texts)
+    
+    # If runs don't match paragraph text, we need to preserve spaces
+    needs_space_preservation = concatenated_runs != original_para_text
+    
+    para_pos = 0
     for i, run in enumerate(para.runs):
         if not run.text:
             continue
-            
+        
+        # If space preservation is needed, check for gaps
+        if needs_space_preservation and para_pos < len(original_para_text):
+            run_start = original_para_text.find(run.text, para_pos)
+            if run_start >= 0 and run_start > para_pos:
+                # There's a gap (likely spaces) before this run
+                gap = original_para_text[para_pos:run_start]
+                if ' ' in gap:
+                    # Add space to marked text
+                    marked_text += ' '
+                para_pos = run_start + len(run.text)
+            elif run_start >= 0:
+                para_pos = run_start + len(run.text)
+        
         # Determine format markers
         markers = []
         if run.bold:
@@ -850,8 +908,9 @@ def apply_smart_formatting(para, translation: str, original: str):
     """Smart format application based on run analysis - optimized for different complexity levels"""
     
     # CRITICAL: Remove any markers that might have leaked through
-    translation = re.sub(r'<<<TRANSLATION_\d+_START>>>', '', translation)
-    translation = re.sub(r'<<<TRANSLATION_\d+_END>>>', '', translation)
+    # Remove ALL delimiter markers (catches any variations including translated ones like <<<TRANULATION_1_END>>>)
+    translation = remove_delimiter_markers(translation)
+    # Remove robust formatting markers (not needed for standard formatting)
     translation = re.sub(r'««[^»]+»»', '', translation)
     
     if not para.runs:
@@ -1213,7 +1272,7 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
         raise Exception(error_msg)
     
     # Load document
-    doc = Document(io.BytesIO(file_bytes))
+    doc = load_document(file_bytes)
     paragraphs = doc.paragraphs
     
     print(f"[TRANSLATOR] Document has {len(paragraphs)} total paragraphs")
@@ -1251,6 +1310,7 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
         para = paragraphs[i]
         # CRITICAL: Do NOT strip - preserve ALL whitespace including indentation
         original = para.text  # Keep exact formatting
+
 
         # Skip single uppercase letters followed by uppercase text (but don't remove them!)
         if re.fullmatch(r"[A-Z]", original) and i + 1 < len(paragraphs) and paragraphs[i + 1].text.strip()[:1].isupper():
@@ -1404,6 +1464,7 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
                 for para_idx, para, original in batch:
                     marked_text, para_data = preserver.create_formatted_text_for_translation(para, para_idx)
                     marked_batch.append((para_idx, marked_text))
+                    print(f"[ROBUST INPUT] Para {para_idx} ({len(original)} chars): {preview_text(original)}")
                 
                 # Create robust prompt
                 prompt = create_robust_translation_prompt(marked_batch, language)
@@ -1411,6 +1472,10 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
                 
                 # Call API with robust prompt
                 batch_result = await call_gemini_batch_async(executor, client, prompt, model, batch_logs)
+                
+                # Handle case where API returned None or empty result
+                if not batch_result or 'text' not in batch_result:
+                    raise RuntimeError("Gemini robust translation returned no result")
                 
                 # Parse with robust parser
                 if batch_result and 'text' in batch_result:
@@ -1434,8 +1499,15 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
                 # Create batch prompt
                 prompt = create_batch_prompt(batch_paragraphs, language)
                 
+                print(f"[STANDARD INPUT] Batch {batch_idx + 1}: sending {len(batch)} paragraphs to Gemini")
+                for para_idx, para, original in batch:
+                    print(f"   - Para {para_idx} ({len(original)} chars): {preview_text(original)}")
+                
                 # Call API asynchronously
                 batch_result = await call_gemini_batch_async(executor, client, prompt, model, batch_logs)
+                
+                if not batch_result:
+                    raise RuntimeError("Gemini standard translation returned no result")
                 
                 # Update progress immediately after batch completes
                 if progress_id:
@@ -1681,7 +1753,7 @@ async def translate_document_content_async_openrouter(file_bytes: bytes, file_na
     print(f"[TRANSLATOR] Initializing OpenRouter client")
     
     # Load document
-    doc = Document(io.BytesIO(file_bytes))
+    doc = load_document(file_bytes)
     paragraphs = doc.paragraphs
     
     print(f"[TRANSLATOR] Document has {len(paragraphs)} total paragraphs")
@@ -1942,7 +2014,7 @@ async def translate_document_content_async_robust(
     logs.append(f"[INFO] Model: {model}")
     
     # Load document
-    doc = Document(io.BytesIO(file_bytes))
+    doc = load_document(file_bytes)
     total_paragraphs = len(doc.paragraphs)
     logs.append(f"[LOAD] Document loaded with {total_paragraphs} paragraphs")
     
@@ -2011,6 +2083,10 @@ async def translate_document_content_async_robust(
         logs.append(f"[BATCH {batch_idx + 1}/{total_batches}] Processing {len(batch)} paragraphs...")
         
         # Create robust prompt
+        print(f"[ROBUST INPUT] Batch {batch_idx + 1}: sending {len(batch)} paragraphs to Gemini")
+        for para_id, marked_text in batch:
+            clean_text = re.sub(r'««[^»]+»»', '', marked_text)
+            print(f"   - Para {para_id}: {preview_text(clean_text)}")
         prompt = create_robust_translation_prompt(batch, language)
         
         # Call API with timeout and retry logic
@@ -2319,6 +2395,177 @@ def create_batch_prompt(paragraphs: List[str], language: str) -> str:
     # Use delimiter-based format to preserve ALL formatting (no JSON mangling)
     BATCH_PROMPT_TEMPLATE = """
 You are a professional translator. Translate {count} passage(s) into {language}.
+
+🎯 CRITICAL: READING LEVEL & MODERNIZATION REQUIREMENT:
+
+**8TH GRADE READING LEVEL - MANDATORY:**
+- Translate ALL text to modern, contemporary language suitable for 8th grade reading level (ages 13-14)
+- This applies to ALL target languages, including English-to-English translation
+
+**🔴 ENGLISH-TO-ENGLISH MODERNIZATION - ABSOLUTELY REQUIRED:**
+- When target language is "English" or "Contemporary English", you MUST still translate/modernize the text
+- DO NOT leave text unchanged just because it's already in English
+- You MUST modernize old/archaic English to contemporary English
+- You MUST simplify complex language to 8th grade level
+- You MUST replace formal/old-fashioned words with modern equivalents
+- Even if the text looks "modern", you MUST ensure it's at 8th grade reading level
+- This is NOT optional - English-to-English still requires active translation work
+- Every word and sentence must be reviewed and modernized if needed
+
+**MODERNIZATION REQUIREMENTS:**
+- If source text is in old/archaic English, modernize it to contemporary English
+- Use simple, clear, everyday language that common people can easily understand
+- Replace formal academic language with conversational language
+- Replace complex vocabulary with simpler 8th grade level words
+- Replace archaic words with modern equivalents:
+  * "thou/thee/thy" → "you/your"
+  * "hath/hast" → "has/have"
+  * "doth" → "does"
+  * "art" → "are"
+  * "wilt" → "will"
+  * "hither/thither" → "here/there"
+  * "whence" → "from where"
+  * "whither" → "to where"
+  * "betwixt" → "between"
+  * "ere" → "before"
+  * "nigh" → "near"
+  * "oft" → "often"
+  * "perchance" → "perhaps"
+  * "verily" → "truly" or "really"
+  * "hence" → "therefore" or "so"
+  * "thus" → "so" or "in this way"
+  * "wherefore" → "why"
+  * "methinks" → "I think"
+  * "prithee" → "please"
+  * "anon" → "soon" or "later"
+- Simplify complex sentence structures into clear, straightforward sentences
+- Break up very long sentences into shorter, more readable ones
+- Use active voice instead of passive voice when possible
+- Replace formal/archaic expressions with modern, conversational equivalents
+- Maintain the meaning and tone, but make it accessible to modern readers
+- Even if translating to English, modernize old English to contemporary English
+
+**EXAMPLES - ENGLISH-TO-ENGLISH MODERNIZATION:**
+
+Example 1 - Archaic English:
+- Old: "Thou art a goodly fellow, methinks."
+- Modern: "I think you're a good person."
+- ❌ WRONG: Leaving it as "Thou art a goodly fellow, methinks." (unchanged)
+- ✅ CORRECT: Modernizing to "I think you're a good person."
+
+Example 2 - Archaic Questions:
+- Old: "Whence comest thou, and whither goest thou?"
+- Modern: "Where are you coming from, and where are you going?"
+- ❌ WRONG: Leaving it unchanged
+- ✅ CORRECT: Modernizing to contemporary English
+
+Example 3 - Formal/Old English:
+- Old: "Verily, I say unto thee, this matter doth concern us all."
+- Modern: "I'm telling you, this matter concerns all of us."
+- ❌ WRONG: Leaving it unchanged
+- ✅ CORRECT: Modernizing to conversational English
+
+Example 4 - Complex Academic English:
+- Old: "The aforementioned individual has demonstrated a propensity for engaging in activities that are not in accordance with established protocols."
+- Modern: "This person has a habit of doing things that break the rules."
+- ❌ WRONG: Leaving complex academic language unchanged
+- ✅ CORRECT: Simplifying to 8th grade level
+
+Example 5 - Old-Fashioned Formal English:
+- Old: "Hath he not spoken thus to thee ere this day?"
+- Modern: "Hasn't he said this to you before today?"
+- ❌ WRONG: Leaving it unchanged
+- ✅ CORRECT: Modernizing to contemporary English
+
+Example 6 - Even "Modern" English Needs Simplification:
+- Old: "The individual's cognitive processes were significantly impeded by the complexity of the situation."
+- Modern: "The person had trouble thinking because the situation was too complicated."
+- ❌ WRONG: Leaving complex academic language unchanged
+- ✅ CORRECT: Simplifying to 8th grade level
+
+**REMEMBER:**
+- When target is "English" or "Contemporary English", you MUST actively modernize
+- Do NOT copy text unchanged - always review and modernize
+- Every sentence must be checked for 8th grade readability
+- Complex words → Simple words
+- Formal language → Conversational language
+- Old English → Modern English
+
+**LINK / URL HANDLING - CRITICAL:**
+- REMOVE all hyperlinks, URLs, and link markup from the translation
+- If original text contains a URL (http://, https://, www., etc.) → OMIT it entirely
+- If original text contains Markdown links like `[text](url)` → Output ONLY the text, remove the `(url)`
+- If original text contains angle-bracket links `<http://...>` → Remove them completely
+- If original text contains HTML links `<a href="...">text</a>` → Output only the text, remove the href
+- If original contains "See here: https://..." → Translate "See here:" but REMOVE the URL
+- NEVER translate or preserve URLs or links – they must be removed
+- This prevents duplicated content and unnecessary link noise in the translation
+
+🚫 CRITICAL: NO HALLUCINATION - EXACT LINE & CONTENT PRESERVATION:
+
+**MANDATORY - ZERO HALLUCINATION POLICY:**
+- DO NOT add any content that is not in the original text
+- DO NOT remove any content from the original text
+- DO NOT add extra sentences, explanations, or commentary
+- DO NOT summarize or condense the text
+- DO NOT expand or elaborate on the text
+- Translate sentence-by-sentence, maintaining exact sentence count
+- If original has 5 lines → translation MUST have exactly 5 lines
+- If original has 10 sentences → translation MUST have exactly 10 sentences
+- Count lines before translating and ensure your translation has the SAME number of lines
+- Count sentences before translating and ensure your translation has the SAME number of sentences
+
+**LINE COUNT PRESERVATION - ABSOLUTE REQUIREMENT:**
+- Count the number of lines in the original passage (lines separated by \\n)
+- Your translation MUST have the EXACT same number of lines
+- Example: If original has 5 lines:
+  Line 1: "Hello"
+  Line 2: "How are you?"
+  Line 3: "I am fine."
+  Line 4: "Thank you."
+  Line 5: "Goodbye"
+  
+  Translation MUST also have exactly 5 lines:
+  Line 1: [translation of line 1]
+  Line 2: [translation of line 2]
+  Line 3: [translation of line 3]
+  Line 4: [translation of line 4]
+  Line 5: [translation of line 5]
+  
+- DO NOT combine lines into one
+- DO NOT split one line into multiple lines
+- DO NOT add blank lines
+- DO NOT remove blank lines
+- If original has a blank line, translation must have a blank line in the same position
+
+**SENTENCE COUNT PRESERVATION:**
+- Count the number of sentences in the original (sentences end with . ! ?)
+- Your translation MUST have the EXACT same number of sentences
+- Translate each sentence independently - do not combine or split sentences
+- If original has 3 sentences, translation must have 3 sentences
+- DO NOT add explanatory sentences
+- DO NOT add transitional phrases that weren't in the original
+- DO NOT remove sentences or combine them
+
+**CONTENT FIDELITY:**
+- Translate ONLY what is written - nothing more, nothing less
+- If a sentence is unclear, translate it as written - do not "clarify" or "improve" it
+- Do not add context or background information
+- Do not add examples or explanations
+- Do not add connecting words or phrases that weren't in the original
+- Maintain the exact structure: if original is terse, translation should be terse
+- Maintain the exact structure: if original is verbose, translation should be verbose
+
+**ANTI-HALLUCINATION CHECKLIST:**
+Before submitting your translation, verify:
+✓ Same number of lines as original
+✓ Same number of sentences as original
+✓ No added content
+✓ No removed content
+✓ No added explanations
+✓ No added examples
+✓ No added transitions
+✓ Exact 1:1 correspondence between original and translation
 
 🔴 CRITICAL FORMATTING RULES - CHARACTER-BY-CHARACTER PRESERVATION:
 
