@@ -15,6 +15,52 @@ from dataclasses import dataclass, asdict
 import hashlib
 
 
+def _safe_int(value):
+    """Convert a numeric value to int, tolerating floats/strings/Length objects."""
+    if value is None:
+        return None
+    # Handle python-docx Length objects (they have .pt property)
+    if hasattr(value, 'pt'):
+        return int(value.pt)
+    if isinstance(value, int):
+        return value
+    try:
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return None
+            try:
+                return int(value)
+            except ValueError:
+                return int(float(value))
+        # Try direct int conversion
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_float(value):
+    """Convert a numeric value to float, tolerating Length objects/strings."""
+    if value is None:
+        return None
+    # Handle python-docx Length objects (they have .pt property)
+    if hasattr(value, 'pt'):
+        return float(value.pt)
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return None
+            return float(value)
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+
 @dataclass
 class RunFormatting:
     """Complete formatting information for a run"""
@@ -97,10 +143,36 @@ class RobustFormatPreserver:
         
     def extract_run_formatting(self, run: Run) -> RunFormatting:
         """Extract complete formatting from a run"""
-        # Get font color
+        import traceback
+        try:
+            return self._extract_run_formatting_impl(run)
+        except Exception as e:
+            print(f"[EXTRACT ERROR] Failed to extract run formatting: {e}")
+            print(f"[EXTRACT ERROR] Traceback:\n{traceback.format_exc()}")
+            raise
+    
+    def _extract_run_formatting_impl(self, run: Run) -> RunFormatting:
+        """Internal implementation of run formatting extraction"""
+        # Get font color - store as integer to avoid float string issues
         font_color = None
         if run.font.color and run.font.color.rgb:
-            font_color = str(run.font.color.rgb)
+            # Convert RGBColor to integer value to avoid float string conversion issues
+            rgb_val = run.font.color.rgb
+            try:
+                # RGBColor has __int__ method
+                if hasattr(rgb_val, '__int__'):
+                    font_color = str(int(rgb_val))
+                elif isinstance(rgb_val, (int, float)):
+                    font_color = str(int(rgb_val))
+                else:
+                    # Fallback: try to parse as string
+                    rgb_str = str(rgb_val)
+                    try:
+                        font_color = str(int(rgb_str))
+                    except ValueError:
+                        font_color = str(int(float(rgb_str)))
+            except Exception as e:
+                font_color = None
         elif run.font.color and run.font.color.theme_color:
             font_color = f"theme:{run.font.color.theme_color}"
             
@@ -108,7 +180,16 @@ class RobustFormatPreserver:
         highlight_color = None
         if run.font.highlight_color:
             highlight_color = str(run.font.highlight_color)
-            
+        
+        # Get font size - MUST use _safe_int to handle Length objects returning floats
+        font_size = None
+        if run.font.size:
+            font_size = _safe_int(run.font.size)
+        
+        # Get character spacing and position - use _safe_int for safety
+        character_spacing = _safe_int(getattr(run.font, 'spacing', None))
+        position = _safe_int(getattr(run.font, 'position', None))
+
         return RunFormatting(
             text=run.text,
             bold=run.bold,
@@ -119,7 +200,7 @@ class RobustFormatPreserver:
             subscript=run.font.subscript,
             superscript=run.font.superscript,
             font_name=run.font.name,
-            font_size=run.font.size.pt if run.font.size else None,
+            font_size=font_size,
             font_color=font_color,
             highlight_color=highlight_color,
             all_caps=run.font.all_caps,
@@ -128,36 +209,48 @@ class RobustFormatPreserver:
             emboss=run.font.emboss,
             imprint=run.font.imprint,
             outline=run.font.outline,
-            character_spacing=getattr(run.font, 'spacing', None),
-            position=getattr(run.font, 'position', None)
+            character_spacing=character_spacing,
+            position=position
         )
     
     def extract_paragraph_formatting(self, para: Paragraph) -> ParagraphFormatting:
         """Extract complete paragraph formatting"""
-        # Extract tab stops
+        
+        # Helper to safely get paragraph format properties
+        # The document may have corrupt values that cause python-docx to throw errors
+        def safe_get(func, default=None):
+            try:
+                return func()
+            except (ValueError, TypeError, AttributeError):
+                return default
+        
+        # Extract tab stops - use _safe_float to handle Length objects
         tab_stops = []
-        if para.paragraph_format.tab_stops:
-            for tab in para.paragraph_format.tab_stops:
-                tab_stops.append({
-                    'position': tab.position.pt if tab.position else None,
-                    'alignment': tab.alignment,
-                    'leader': tab.leader
-                })
+        try:
+            if para.paragraph_format.tab_stops:
+                for tab in para.paragraph_format.tab_stops:
+                    tab_stops.append({
+                        'position': _safe_float(tab.position),
+                        'alignment': tab.alignment,
+                        'leader': tab.leader
+                    })
+        except (ValueError, TypeError, AttributeError):
+            pass  # Skip corrupt tab stops
         
         return ParagraphFormatting(
-            style=para.style.name if para.style else None,
-            alignment=para.alignment,
-            left_indent=para.paragraph_format.left_indent.pt if para.paragraph_format.left_indent else None,
-            right_indent=para.paragraph_format.right_indent.pt if para.paragraph_format.right_indent else None,
-            first_line_indent=para.paragraph_format.first_line_indent.pt if para.paragraph_format.first_line_indent else None,
-            space_before=para.paragraph_format.space_before.pt if para.paragraph_format.space_before else None,
-            space_after=para.paragraph_format.space_after.pt if para.paragraph_format.space_after else None,
-            line_spacing=para.paragraph_format.line_spacing,
-            line_spacing_rule=para.paragraph_format.line_spacing_rule,
-            keep_together=para.paragraph_format.keep_together,
-            keep_with_next=para.paragraph_format.keep_with_next,
-            page_break_before=para.paragraph_format.page_break_before,
-            widow_control=para.paragraph_format.widow_control,
+            style=safe_get(lambda: para.style.name if para.style else None),
+            alignment=safe_get(lambda: para.alignment),
+            left_indent=safe_get(lambda: _safe_float(para.paragraph_format.left_indent)),
+            right_indent=safe_get(lambda: _safe_float(para.paragraph_format.right_indent)),
+            first_line_indent=safe_get(lambda: _safe_float(para.paragraph_format.first_line_indent)),
+            space_before=safe_get(lambda: _safe_float(para.paragraph_format.space_before)),
+            space_after=safe_get(lambda: _safe_float(para.paragraph_format.space_after)),
+            line_spacing=safe_get(lambda: _safe_float(para.paragraph_format.line_spacing)),
+            line_spacing_rule=safe_get(lambda: para.paragraph_format.line_spacing_rule),
+            keep_together=safe_get(lambda: para.paragraph_format.keep_together),
+            keep_with_next=safe_get(lambda: para.paragraph_format.keep_with_next),
+            page_break_before=safe_get(lambda: para.paragraph_format.page_break_before),
+            widow_control=safe_get(lambda: para.paragraph_format.widow_control),
             tab_stops=tab_stops
         )
     
@@ -326,6 +419,11 @@ class RobustFormatPreserver:
             
             # CRITICAL: Clean any nested or remaining markers from run text
             run_text = re.sub(r'««[^»]+»»', '', run_text)
+            # Remove properly closed delimiter markers
+            run_text = re.sub(r'<<<[^>]*?>>>', '', run_text, flags=re.DOTALL)
+            # Remove malformed markers without closing >>>
+            run_text = re.sub(r'<<<[^\s]*', '', run_text)
+            run_text = re.sub(r'<<<.*?(?=\s|$)', '', run_text, flags=re.DOTALL)
             
             # Find original format
             original_run = next((r for r in para_data['runs'] if r['id'] == run_id), None)
@@ -351,6 +449,11 @@ class RobustFormatPreserver:
             remaining = translated_text[last_end:]
             # Remove any markers from remaining text
             remaining = re.sub(r'««[^»]+»»', '', remaining)
+            # Remove properly closed delimiter markers
+            remaining = re.sub(r'<<<[^>]*?>>>', '', remaining, flags=re.DOTALL)
+            # Remove malformed markers without closing >>>
+            remaining = re.sub(r'<<<[^\s]*', '', remaining)
+            remaining = re.sub(r'<<<.*?(?=\s|$)', '', remaining, flags=re.DOTALL)
             if remaining.strip():
                 parsed_runs.append({
                     'text': remaining,
@@ -362,9 +465,11 @@ class RobustFormatPreserver:
         if not parsed_runs:
             # Aggressively remove all markers and return clean text
             clean_text = re.sub(r'««[^»]+»»', '', translated_text)
-            # Remove delimiter markers
-            clean_text = re.sub(r'<<<TRANSLATION_\d+_START>>>', '', clean_text)
-            clean_text = re.sub(r'<<<TRANSLATION_\d+_END>>>', '', clean_text)
+            # Remove properly closed delimiter markers
+            clean_text = re.sub(r'<<<[^>]*?>>>', '', clean_text, flags=re.DOTALL)
+            # Remove malformed markers without closing >>>
+            clean_text = re.sub(r'<<<[^\s]*', '', clean_text)
+            clean_text = re.sub(r'<<<.*?(?=\s|$)', '', clean_text, flags=re.DOTALL)
             # Also remove any partial markers that might remain
             clean_text = re.sub(r'««.*', '', clean_text)
             clean_text = re.sub(r'.*»»', '', clean_text)
@@ -375,15 +480,23 @@ class RobustFormatPreserver:
     def apply_formatting_to_paragraph(self, para: Paragraph, para_id: int, translated_text: str):
         """Apply all formatting to translated paragraph"""
         # CRITICAL: Remove ALL delimiter markers first (catches any variations including translated/misspelled ones)
-        # Remove any text between <<< and >>> (comprehensive removal)
+        # First: Remove properly closed markers <<<...>>>
         translated_text = re.sub(r'<<<[^>]*?>>>', '', translated_text, flags=re.DOTALL)
+        # Second: Remove MALFORMED markers that start with <<< but have no closing >>>
+        # Match <<< followed by ANY characters until whitespace or end of string
+        translated_text = re.sub(r'<<<[^\s]*', '', translated_text)
+        # Also catch any remaining <<< patterns (defensive)
+        translated_text = re.sub(r'<<<.*?(?=\s|$)', '', translated_text, flags=re.DOTALL)
         
         para_data = self.format_map.get(para_id)
         if not para_data:
             # No format data - remove any markers and set plain text
             clean_text = re.sub(r'««[^»]+»»', '', translated_text)
-            # Remove any remaining delimiter markers (comprehensive removal)
+            # Remove properly closed markers
             clean_text = re.sub(r'<<<[^>]*?>>>', '', clean_text, flags=re.DOTALL)
+            # Remove malformed markers without closing >>>
+            clean_text = re.sub(r'<<<[^\s]*', '', clean_text)
+            clean_text = re.sub(r'<<<.*?(?=\s|$)', '', clean_text, flags=re.DOTALL)
             for run in para.runs:
                 run.text = ""
             if para.runs:
@@ -400,8 +513,11 @@ class RobustFormatPreserver:
             if 'text' in run_data:
                 # Remove any remaining markers from the text (both robust and delimiter markers)
                 run_data['text'] = re.sub(r'««[^»]+»»', '', run_data['text'])
-                # Remove ALL delimiter markers (comprehensive removal - catches any variations)
+                # Remove properly closed delimiter markers
                 run_data['text'] = re.sub(r'<<<[^>]*?>>>', '', run_data['text'], flags=re.DOTALL)
+                # Remove malformed markers without closing >>>
+                run_data['text'] = re.sub(r'<<<[^\s]*', '', run_data['text'])
+                run_data['text'] = re.sub(r'<<<.*?(?=\s|$)', '', run_data['text'], flags=re.DOTALL)
         
         # Clear existing runs
         for run in para.runs:
@@ -467,23 +583,30 @@ class RobustFormatPreserver:
             if fmt.get('font_name'):
                 run.font.name = fmt['font_name']
             if fmt.get('font_size'):
-                run.font.size = Pt(fmt['font_size'])
+                # Use _safe_int to handle any float values stored
+                size_val = _safe_int(fmt['font_size'])
+                if size_val:
+                    run.font.size = Pt(size_val)
             
             # Color handling
             if fmt.get('font_color'):
-                if fmt['font_color'].startswith('theme:'):
+                if str(fmt['font_color']).startswith('theme:'):
                     # Theme color - would need special handling
                     pass
                 else:
                     try:
-                        # Parse RGB color
-                        rgb_int = int(fmt['font_color'])
-                        run.font.color.rgb = RGBColor(
-                            (rgb_int >> 16) & 0xFF,
-                            (rgb_int >> 8) & 0xFF,
-                            rgb_int & 0xFF
-                        )
-                    except:
+                        # Parse RGB color - handle both int and float strings using _safe_int
+                        rgb_int = _safe_int(fmt['font_color'])
+                        
+                        # Validate RGB value is in valid range (0 to 16777215 = 0xFFFFFF)
+                        if rgb_int is not None and 0 <= rgb_int <= 16777215:
+                            run.font.color.rgb = RGBColor(
+                                (rgb_int >> 16) & 0xFF,
+                                (rgb_int >> 8) & 0xFF,
+                                rgb_int & 0xFF
+                            )
+                    except (ValueError, TypeError, OverflowError) as e:
+                        # Invalid color value - skip color setting
                         pass
             
             # Advanced formatting

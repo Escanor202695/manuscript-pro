@@ -755,16 +755,23 @@ def remove_delimiter_markers(text: str) -> str:
     """
     Remove ALL delimiter markers in format <<<...>>> - catches any variations including translated/misspelled ones.
     This ensures no delimiter markers (like <<<TRANULATION_1_END>>>) end up in the final document.
+    Also removes malformed markers that don't have proper closing (like <<<TRANSL000000...).
     """
     if not text:
         return text
-    # Remove ANY text between <<< and >>> (catches all variations including translated markers)
-    # This pattern matches:
-    # - <<<TRANSLATION_1_START>>>
-    # - <<<TRANULATION_1_END>>> (translated/misspelled)
-    # - <<<TRANSLATION_START_1>>>
-    # - Any other <<<...>>> pattern
+    
+    # First: Remove properly closed markers <<<...>>>
     text = re.sub(r'<<<[^>]*?>>>', '', text, flags=re.DOTALL)
+    
+    # Second: Remove MALFORMED markers that start with <<< but have no closing >>>
+    # Match <<< followed by ANY characters (including newlines) until whitespace or end of string
+    # This catches cases like <<<TRANSL000000000000... that go on forever
+    # Use non-greedy match to stop at first whitespace
+    text = re.sub(r'<<<[^\s]*', '', text)
+    
+    # Also catch any remaining <<< patterns (defensive)
+    text = re.sub(r'<<<.*?(?=\s|$)', '', text, flags=re.DOTALL)
+    
     return text
 
 def sanitize_response(text: str) -> str:
@@ -1517,9 +1524,13 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
                 
         except Exception as e:
             # CRITICAL ERROR HANDLING: If batch fails, wrap with <untranslated> tag
+            import traceback
+            full_traceback = traceback.format_exc()
             batch_logs.append(f"[ERROR] Batch {batch_idx + 1} FAILED: {str(e)}")
+            batch_logs.append(f"[ERROR] Full traceback:\n{full_traceback}")
             batch_logs.append(f"[ERROR] Wrapping failed batch with <untranslated> tag to preserve original")
             print(f"[ERROR] Batch {batch_idx + 1} failed: {str(e)}")
+            print(f"[TRACEBACK]\n{full_traceback}")
             
             # Create a failed batch result with untranslated wrapper
             failed_result = {
@@ -2624,6 +2635,10 @@ Before submitting your translation, verify:
    - NO extra text before/after delimiters
    - NO explanations or notes
    - PRESERVE all spaces and newlines inside delimiters
+   - ⚠️ CRITICAL: Do NOT put delimiter markers (<<<TRANSLATION_...) INSIDE your translation text
+   - ⚠️ Do NOT generate random <<< markers or patterns like <<<TRANSL000... 
+   - ⚠️ The ONLY <<< markers you should output are the START and END delimiters wrapping each translation
+   - Your translation text should ONLY contain the actual translated content, NO delimiter markers
 
 EXAMPLES:
 
