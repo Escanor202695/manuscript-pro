@@ -40,6 +40,15 @@ except ImportError:
     ROBUST_FORMATTING_AVAILABLE = False
     print("[WARNING] Robust format preservation module not available")
 
+# Import TOC handler
+try:
+    from toc_handler import process_toc_before_translation
+    TOC_HANDLER_AVAILABLE = True
+    print("[INFO] TOC handler loaded successfully")
+except ImportError as e:
+    TOC_HANDLER_AVAILABLE = False
+    print(f"[WARNING] TOC handler module not available: {e}")
+
 # Allow OAuth scope changes (Google may return broader permissions than requested)
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 
@@ -911,6 +920,81 @@ def analyze_batch_complexity(batch: List[Tuple[int, Any, str]]) -> dict:
     }
 
 
+def detect_case_change_in_text(text: str) -> bool:
+    """
+    Check if text has significant case changes (all-caps words mixed with mixed-case).
+    This helps preserve case patterns like "HELLO, how you doing?"
+    """
+    if not text or len(text) < 2:
+        return False
+    
+    words = []
+    word_pattern = re.compile(r'\b[A-Za-z]+\b')
+    for match in word_pattern.finditer(text):
+        word = match.group(0)
+        words.append(word)
+    
+    if len(words) < 2:
+        return False
+    
+    has_upper_word = False
+    has_mixed_word = False
+    
+    for word in words:
+        # Multi-letter all uppercase word
+        if word.isupper() and len(word) > 1:
+            has_upper_word = True
+        # Mixed case or lowercase word (not all caps)
+        elif not word.isupper():
+            has_mixed_word = True
+        
+        # If we have both, we need to split
+        if has_upper_word and has_mixed_word:
+            return True
+    
+    return False
+
+
+def split_text_by_case_boundaries(text: str) -> List[Tuple[int, int]]:
+    """
+    Split text into segments at case boundaries.
+    Returns list of (start, end) tuples for each segment.
+    Only splits at boundaries between all-uppercase words and mixed/lowercase words.
+    """
+    if not text:
+        return [(0, 0)]
+    
+    word_pattern = re.compile(r'\b[A-Za-z]+\b')
+    words_info = []
+    for match in word_pattern.finditer(text):
+        word = match.group(0)
+        words_info.append((match.start(), match.end(), word))
+    
+    if len(words_info) < 2:
+        return [(0, len(text))]
+    
+    segments = []
+    segment_start = 0
+    last_word_was_upper = None
+    
+    for word_start, word_end, word in words_info:
+        is_upper = word.isupper() and len(word) > 1  # Multi-letter all caps
+        
+        if last_word_was_upper is not None:
+            # Check if case pattern changed significantly
+            if is_upper != last_word_was_upper:
+                # Case pattern changed - end previous segment before this word
+                segments.append((segment_start, word_start))
+                segment_start = word_start
+        
+        last_word_was_upper = is_upper
+    
+    # Add final segment
+    segments.append((segment_start, len(text)))
+    
+    return segments if len(segments) > 1 else [(0, len(text))]
+
+
 def apply_smart_formatting(para, translation: str, original: str):
     """Smart format application based on run analysis - optimized for different complexity levels"""
     
@@ -927,6 +1011,38 @@ def apply_smart_formatting(para, translation: str, original: str):
     
     # Analyze run complexity
     run_count = len([r for r in para.runs if r.text.strip()])
+    
+    # NEW: Check for case changes in original text and handle them specially
+    if detect_case_change_in_text(original) and run_count <= 4:
+        # Split both original and translation by case boundaries
+        original_segments = split_text_by_case_boundaries(original)
+        translation_segments = split_text_by_case_boundaries(translation)
+        
+        # Extract actual text segments
+        original_text_segments = [original[start:end] for start, end in original_segments]
+        translation_text_segments = [translation[start:end] for start, end in translation_segments]
+        
+        # If we have matching number of segments and enough runs, apply to separate runs
+        if (len(original_text_segments) == len(translation_text_segments) and 
+            len(translation_text_segments) <= run_count and
+            len(translation_text_segments) >= 2):
+            
+            # Clear existing runs
+            for run in para.runs:
+                run.text = ""
+            
+            # Apply each case segment to its own run
+            for i, (run, trans_seg) in enumerate(zip(para.runs[:len(translation_text_segments)], translation_text_segments)):
+                run.text = trans_seg
+                # Add space if not last segment and segments should connect
+                if i < len(translation_text_segments) - 1 and not trans_seg.rstrip().endswith((' ', ',', '.', '!', '?', ';', ':')):
+                    run.text += ' '
+            
+            # Clear remaining runs
+            for run in para.runs[len(translation_text_segments):]:
+                run.text = ""
+            
+            return  # Early return - case splitting handled
     
     if run_count <= 1:
         # Simple case - single format, current implementation is perfect
@@ -1280,12 +1396,29 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
     
     # Load document
     doc = load_document(file_bytes)
+    
+    # Initialize logs early for TOC processing
+    logs = []
+    
+    # ========== PROCESS TOC BEFORE TRANSLATION ==========
+    if TOC_HANDLER_AVAILABLE:
+        toc_results = process_toc_before_translation(doc)
+        if toc_results['toc_found']:
+            logs.append(f"[TOC] Found {toc_results['toc_entries_count']} TOC entries in first 10 pages")
+            logs.append(f"[TOC] Extracted {toc_results['titles_extracted']} titles from TOC")
+            logs.append(f"[TOC] Converted {toc_results['paragraphs_converted']} paragraphs to Heading 2 style")
+            logs.append(f"[TOC] Removed {toc_results['toc_removed']} TOC entry paragraphs")
+            if toc_results['placeholder_inserted']:
+                logs.append(f"[TOC] Inserted placeholder for auto-generated TOC")
+            print(f"[TOC PROCESSING] Found {toc_results['toc_entries_count']} entries, converted {toc_results['paragraphs_converted']} to Heading 2")
+        else:
+            logs.append(f"[TOC] No TOC found in first 10 pages")
+    
     paragraphs = doc.paragraphs
     
     print(f"[TRANSLATOR] Document has {len(paragraphs)} total paragraphs")
     
     translated_content = []
-    logs = []
     total_input_tokens = 0
     total_output_tokens = 0
     
@@ -1765,12 +1898,29 @@ async def translate_document_content_async_openrouter(file_bytes: bytes, file_na
     
     # Load document
     doc = load_document(file_bytes)
+    
+    # Initialize logs early for TOC processing
+    logs = []
+    
+    # ========== PROCESS TOC BEFORE TRANSLATION ==========
+    if TOC_HANDLER_AVAILABLE:
+        toc_results = process_toc_before_translation(doc)
+        if toc_results['toc_found']:
+            logs.append(f"[TOC] Found {toc_results['toc_entries_count']} TOC entries in first 10 pages")
+            logs.append(f"[TOC] Extracted {toc_results['titles_extracted']} titles from TOC")
+            logs.append(f"[TOC] Converted {toc_results['paragraphs_converted']} paragraphs to Heading 2 style")
+            logs.append(f"[TOC] Removed {toc_results['toc_removed']} TOC entry paragraphs")
+            if toc_results['placeholder_inserted']:
+                logs.append(f"[TOC] Inserted placeholder for auto-generated TOC")
+            print(f"[TOC PROCESSING] Found {toc_results['toc_entries_count']} entries, converted {toc_results['paragraphs_converted']} to Heading 2")
+        else:
+            logs.append(f"[TOC] No TOC found in first 10 pages")
+    
     paragraphs = doc.paragraphs
     
     print(f"[TRANSLATOR] Document has {len(paragraphs)} total paragraphs")
     
     translated_content = []
-    logs = []
     total_input_tokens = 0
     total_output_tokens = 0
     
@@ -2026,6 +2176,21 @@ async def translate_document_content_async_robust(
     
     # Load document
     doc = load_document(file_bytes)
+    
+    # ========== PROCESS TOC BEFORE TRANSLATION ==========
+    if TOC_HANDLER_AVAILABLE:
+        toc_results = process_toc_before_translation(doc)
+        if toc_results['toc_found']:
+            logs.append(f"[TOC] Found {toc_results['toc_entries_count']} TOC entries in first 10 pages")
+            logs.append(f"[TOC] Extracted {toc_results['titles_extracted']} titles from TOC")
+            logs.append(f"[TOC] Converted {toc_results['paragraphs_converted']} paragraphs to Heading 2 style")
+            logs.append(f"[TOC] Removed {toc_results['toc_removed']} TOC entry paragraphs")
+            if toc_results['placeholder_inserted']:
+                logs.append(f"[TOC] Inserted placeholder for auto-generated TOC")
+            print(f"[TOC PROCESSING] Found {toc_results['toc_entries_count']} entries, converted {toc_results['paragraphs_converted']} to Heading 2")
+        else:
+            logs.append(f"[TOC] No TOC found in first 10 pages")
+    
     total_paragraphs = len(doc.paragraphs)
     logs.append(f"[LOAD] Document loaded with {total_paragraphs} paragraphs")
     
@@ -2456,6 +2621,23 @@ You are a professional translator. Translate {count} passage(s) into {language}.
 - Maintain the meaning and tone, but make it accessible to modern readers
 - Even if translating to English, modernize old English to contemporary English
 
+**NUMBER FORMAT MODERNIZATION - CRITICAL:**
+- Convert ALL Roman numerals to modern Arabic numerals (0-9)
+- Convert ALL old/archaic number formats to modern Arabic numerals
+- Examples of conversions:
+  * Roman numerals: I → 1, II → 2, III → 3, IV → 4, V → 5, VI → 6, VII → 7, VIII → 8, IX → 9, X → 10
+  * Larger Roman numerals: XI → 11, XII → 12, XIII → 13, XIV → 14, XV → 15, XX → 20, L → 50, C → 100, D → 500, M → 1000
+  * "Chapter I" → "Chapter 1"
+  * "Part III" → "Part 3"
+  * "Volume XIV" → "Volume 14"
+  * "Year MDCCLXXVI" → "Year 1776"
+- When translating to modern English (8th grade level), use modern Arabic numerals exclusively
+- Do NOT preserve Roman numerals in modern English translations
+- Convert ordinal Roman numerals: "1st" (not "Ist"), "2nd" (not "IInd"), "3rd" (not "IIIrd"), "4th" (not "IVth")
+- If number is part of a proper noun or historical reference that traditionally uses Roman numerals (like "World War II"), you may preserve it, but prefer modern format when modernizing
+- Convert written-out archaic number forms: "one and twenty" → "21", "three score" → "60"
+- Use standard modern number format: "1,234" not "one thousand two hundred thirty-four" (unless context requires words)
+
 **EXAMPLES - ENGLISH-TO-ENGLISH MODERNIZATION:**
 
 Example 1 - Archaic English:
@@ -2493,6 +2675,30 @@ Example 6 - Even "Modern" English Needs Simplification:
 - Modern: "The person had trouble thinking because the situation was too complicated."
 - ❌ WRONG: Leaving complex academic language unchanged
 - ✅ CORRECT: Simplifying to 8th grade level
+
+Example 7 - Roman Numeral Conversion:
+- Old: "Chapter I discusses the basics."
+- Modern: "Chapter 1 discusses the basics."
+- ❌ WRONG: Leaving "Chapter I" unchanged
+- ✅ CORRECT: Converting to "Chapter 1"
+
+Example 8 - Roman Numeral Conversion (Multiple):
+- Old: "In Part III, Section XIV, we find..."
+- Modern: "In Part 3, Section 14, we find..."
+- ❌ WRONG: Leaving "Part III, Section XIV" unchanged
+- ✅ CORRECT: Converting to "Part 3, Section 14"
+
+Example 9 - Roman Numeral in Title:
+- Old: "Volume II of the collection"
+- Modern: "Volume 2 of the collection"
+- ❌ WRONG: Leaving "Volume II" unchanged
+- ✅ CORRECT: Converting to "Volume 2"
+
+Example 10 - Year with Roman Numerals:
+- Old: "In the year MDCCLXXVI, the Declaration was signed."
+- Modern: "In the year 1776, the Declaration was signed."
+- ❌ WRONG: Leaving "MDCCLXXVI" unchanged
+- ✅ CORRECT: Converting to "1776"
 
 **REMEMBER:**
 - When target is "English" or "Contemporary English", you MUST actively modernize

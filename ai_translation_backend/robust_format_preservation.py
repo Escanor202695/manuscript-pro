@@ -278,11 +278,92 @@ class RobustFormatPreserver:
             run_format.position
         )
     
+    def _has_significant_case_change(self, text: str) -> bool:
+        """
+        Check if text has significant case changes that need to be preserved.
+        Returns True if there are words with different case patterns that should be split.
+        """
+        if not text or len(text) < 2:
+            return False
+        
+        words = []
+        # Extract words (alphanumeric sequences)
+        import re
+        word_pattern = re.compile(r'\b[A-Za-z]+\b')
+        for match in word_pattern.finditer(text):
+            word = match.group(0)
+            words.append((match.start(), match.end(), word))
+        
+        if len(words) < 2:
+            return False
+        
+        # Check if there's a mix of all-uppercase (multi-letter) words and mixed/lowercase words
+        has_upper_word = False
+        has_mixed_word = False
+        
+        for start, end, word in words:
+            # Multi-letter all uppercase word
+            if word.isupper() and len(word) > 1:
+                has_upper_word = True
+            # Mixed case or lowercase word (not all caps)
+            elif not word.isupper():
+                has_mixed_word = True
+            
+            # If we have both, we need to split
+            if has_upper_word and has_mixed_word:
+                return True
+        
+        return False
+    
+    def _split_text_by_case_boundaries(self, text: str) -> List[Tuple[int, int]]:
+        """
+        Split text into segments at case boundaries.
+        Returns list of (start, end) tuples for each segment.
+        Only splits at boundaries between all-uppercase words and mixed/lowercase words.
+        """
+        if not text:
+            return [(0, 0)]
+        
+        import re
+        word_pattern = re.compile(r'\b[A-Za-z]+\b')
+        words = []
+        for match in word_pattern.finditer(text):
+            word = match.group(0)
+            words.append((match.start(), match.end(), word))
+        
+        if len(words) < 2:
+            return [(0, len(text))]
+        
+        segments = []
+        segment_start = 0
+        last_word_was_upper = None
+        
+        for word_start, word_end, word in words:
+            is_upper = word.isupper() and len(word) > 1  # Multi-letter all caps
+            
+            if last_word_was_upper is not None:
+                # Check if case pattern changed significantly
+                if is_upper != last_word_was_upper:
+                    # Case pattern changed - end previous segment before this word
+                    segments.append((segment_start, word_start))
+                    segment_start = word_start
+            
+            last_word_was_upper = is_upper
+        
+        # Add final segment
+        segments.append((segment_start, len(text)))
+        
+        # Don't merge segments - we want to preserve case boundaries even if segments are short
+        # Each segment represents a distinct case pattern that should be preserved
+        return segments if len(segments) > 1 else [(0, len(text))]
+    
     def _merge_runs_with_same_formatting(self, para: Paragraph) -> List[Dict]:
         """
         Merge consecutive runs that have identical formatting.
         This dramatically reduces run count while preserving exact spacing.
         CRITICAL: run.text already contains spaces, so concatenation preserves spacing perfectly.
+        
+        NEW: Also splits on case boundaries to preserve case patterns even when formatting is identical.
         """
         if not para.runs:
             return []
@@ -330,7 +411,36 @@ class RobustFormatPreserver:
         if current_group['runs']:
             merged_groups.append(current_group)
         
-        return merged_groups
+        # POST-PROCESSING: Split merged groups that have significant case changes
+        # This ensures case patterns are preserved even when formatting is identical
+        # Example: "HELLO, how you doing?" should be split into "HELLO, " and "how you doing?"
+        final_groups = []
+        for group in merged_groups:
+            text = group['text']
+            format_obj = group['format_obj']
+            
+            # Check if this group has significant case changes (all-caps words mixed with mixed-case)
+            if self._has_significant_case_change(text):
+                # Split the text at case boundaries
+                segments = self._split_text_by_case_boundaries(text)
+                
+                for start, end in segments:
+                    seg_text = text[start:end]
+                    # Preserve all segments, including whitespace-only segments (important for spacing)
+                    # Create a new group for each case segment
+                    # Use the same run indices for tracking, but with split text
+                    final_groups.append({
+                        'runs': group['runs'],  # Keep reference to original runs
+                        'run_indices': group['run_indices'],
+                        'text': seg_text,
+                        'format': self._get_format_signature(format_obj),
+                        'format_obj': format_obj  # Same formatting, just different case pattern
+                    })
+            else:
+                # No significant case changes, keep as is
+                final_groups.append(group)
+        
+        return final_groups
     
     def create_formatted_text_for_translation(self, para: Paragraph, para_id: int) -> Tuple[str, Dict]:
         """
@@ -684,6 +794,23 @@ Translate the following {len(marked_texts)} passages into {language} with ABSOLU
 - Maintain the meaning and tone, but make it accessible to modern readers
 - Even if translating to English, modernize old English to contemporary English
 
+**NUMBER FORMAT MODERNIZATION - CRITICAL:**
+- Convert ALL Roman numerals to modern Arabic numerals (0-9)
+- Convert ALL old/archaic number formats to modern Arabic numerals
+- Examples of conversions:
+  * Roman numerals: I → 1, II → 2, III → 3, IV → 4, V → 5, VI → 6, VII → 7, VIII → 8, IX → 9, X → 10
+  * Larger Roman numerals: XI → 11, XII → 12, XIII → 13, XIV → 14, XV → 15, XX → 20, L → 50, C → 100, D → 500, M → 1000
+  * "Chapter I" → "Chapter 1"
+  * "Part III" → "Part 3"
+  * "Volume XIV" → "Volume 14"
+  * "Year MDCCLXXVI" → "Year 1776"
+- When translating to modern English (8th grade level), use modern Arabic numerals exclusively
+- Do NOT preserve Roman numerals in modern English translations
+- Convert ordinal Roman numerals: "1st" (not "Ist"), "2nd" (not "IInd"), "3rd" (not "IIIrd"), "4th" (not "IVth")
+- If number is part of a proper noun or historical reference that traditionally uses Roman numerals (like "World War II"), you may preserve it, but prefer modern format when modernizing
+- Convert written-out archaic number forms: "one and twenty" → "21", "three score" → "60"
+- Use standard modern number format: "1,234" not "one thousand two hundred thirty-four" (unless context requires words)
+
 **EXAMPLES - ENGLISH-TO-ENGLISH MODERNIZATION:**
 
 Example 1 - Archaic English:
@@ -721,6 +848,30 @@ Example 6 - Even "Modern" English Needs Simplification:
 - Modern: "The person had trouble thinking because the situation was too complicated."
 - ❌ WRONG: Leaving complex academic language unchanged
 - ✅ CORRECT: Simplifying to 8th grade level
+
+Example 7 - Roman Numeral Conversion:
+- Old: "Chapter I discusses the basics."
+- Modern: "Chapter 1 discusses the basics."
+- ❌ WRONG: Leaving "Chapter I" unchanged
+- ✅ CORRECT: Converting to "Chapter 1"
+
+Example 8 - Roman Numeral Conversion (Multiple):
+- Old: "In Part III, Section XIV, we find..."
+- Modern: "In Part 3, Section 14, we find..."
+- ❌ WRONG: Leaving "Part III, Section XIV" unchanged
+- ✅ CORRECT: Converting to "Part 3, Section 14"
+
+Example 9 - Roman Numeral in Title:
+- Old: "Volume II of the collection"
+- Modern: "Volume 2 of the collection"
+- ❌ WRONG: Leaving "Volume II" unchanged
+- ✅ CORRECT: Converting to "Volume 2"
+
+Example 10 - Year with Roman Numerals:
+- Old: "In the year MDCCLXXVI, the Declaration was signed."
+- Modern: "In the year 1776, the Declaration was signed."
+- ❌ WRONG: Leaving "MDCCLXXVI" unchanged
+- ✅ CORRECT: Converting to "1776"
 
 **REMEMBER:**
 - When target is "English" or "Contemporary English", you MUST actively modernize
@@ -856,6 +1007,32 @@ Before submitting your translation, verify:
    - ONLY translate the words, NOT the punctuation marks
    - Punctuation style is part of the original formatting - preserve it
 
+4.5. **CASE PRESERVATION - CRITICAL**:
+   - PRESERVE THE EXACT CASE PATTERN of each run, even if formatting is identical
+   - If text is split into separate runs, each run has a DISTINCT case pattern that must be preserved
+   - Example: ««RUN0:PLAIN»»HELLO, ««/RUN0»»««RUN1:PLAIN»»how you doing?««/RUN1»»
+     - RUN0 contains "HELLO, " (all uppercase) - preserve as all uppercase in translation
+     - RUN1 contains "how you doing?" (mixed case) - preserve as mixed case in translation
+   - Even though both runs have PLAIN formatting, they are SEPARATE runs because of case differences
+   - CRITICAL: Do NOT normalize case across runs - if RUN0 is all caps, keep it all caps in translation
+   - If a word/segment is ALL UPPERCASE in the source, translate it to ALL UPPERCASE in the target
+   - If a word/segment is mixed case in the source, translate it to mixed case in the target
+   - The fact that text is in separate runs indicates intentional case distinction
+   - Example: "HELLO, how you doing?" → "HOLA, ¿cómo estás?" (not "HOLA, ¿CÓMO ESTÁS?")
+   - Example: ««RUN0:PLAIN»»HELLO««/RUN0»»««RUN1:PLAIN»», how««/RUN1»» → preserve case pattern of each run
+   
+   **CASE PRESERVATION ACROSS LANGUAGE DIFFERENCES - CRITICAL**:
+   - Word boundaries may change during translation (one word becomes multiple, or vice versa)
+   - Word count may change (short word becomes longer phrase, or vice versa)
+   - BUT: The CASE PATTERN of each run must be preserved regardless of these changes
+   - If RUN0 is all uppercase, the ENTIRE translation in RUN0 must remain all uppercase
+   - If RUN1 is mixed case, the ENTIRE translation in RUN1 must remain mixed case
+   - Example: ««RUN0:PLAIN»»HELLO««/RUN0»» → Spanish: ««RUN0:PLAIN»»HOLA««/RUN0»» (HOLA in all caps)
+   - Example: ««RUN0:PLAIN»»HELLO THERE««/RUN0»» → Spanish: ««RUN0:PLAIN»»HOLA ALLÍ««/RUN0»» (both words all caps)
+   - Example: ««RUN0:PLAIN»»OK««/RUN0»» → Spanish: ««RUN0:PLAIN»»DE ACUERDO««/RUN0»» (entire phrase all caps, even though it's multiple words now)
+   - The CASE STYLE is what matters, not the word count or boundaries
+   - Each run's case pattern is INDEPENDENT - translate each run separately and preserve its case style
+
 5. **COMPLETE WORD TRANSLATION - MANDATORY**:
    - TRANSLATE EVERY SINGLE WORD in the source language
    - NO source language words should remain in the translation
@@ -888,6 +1065,18 @@ Before submitting your translation, verify:
 
    Input: "««RUN0:PLAIN»»Yes, certainly, okay.««/RUN0»»"
    Spanish: "««RUN0:PLAIN»»Sí, ciertamente, de acuerdo.««/RUN0»»" (Every word translated)
+
+   Input: "««RUN0:PLAIN»»HELLO, ««/RUN0»»««RUN1:PLAIN»»how you doing?««/RUN1»»"
+   Spanish: "««RUN0:PLAIN»»HOLA, ««/RUN0»»««RUN1:PLAIN»»¿cómo estás?««/RUN1»»" (Case pattern preserved: RUN0 uppercase → uppercase, RUN1 mixed → mixed)
+   
+   Input: "««RUN0:PLAIN»»HELLO««/RUN0»»««RUN1:PLAIN»», how are you?««/RUN1»»"
+   Spanish: "««RUN0:PLAIN»»HOLA««/RUN0»»««RUN1:PLAIN»», ¿cómo estás?««/RUN1»»" (Preserve case: HELLO stays uppercase, rest stays mixed case)
+   
+   Input: "««RUN0:PLAIN»»OK««/RUN0»»««RUN1:PLAIN»», I understand««/RUN1»»"
+   Spanish: "««RUN0:PLAIN»»DE ACUERDO««/RUN0»»««RUN1:PLAIN»», entiendo««/RUN1»»" (Even though "OK" (2 chars) becomes "DE ACUERDO" (10 chars), preserve all caps in RUN0)
+   
+   Input: "««RUN0:PLAIN»»HELLO THERE««/RUN0»»««RUN1:PLAIN»», my friend««/RUN1»»"
+   Spanish: "««RUN0:PLAIN»»HOLA ALLÍ««/RUN0»»««RUN1:PLAIN»», mi amigo««/RUN1»»" (All words in RUN0 stay uppercase even if word count/structure changes)
 
 7. **WARNINGS**:
    ❌ NEVER combine runs
