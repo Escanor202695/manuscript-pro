@@ -23,7 +23,7 @@ import aiohttp
 import hashlib
 from dataclasses import dataclass, asdict
 from docx.shared import RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_UNDERLINE
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_UNDERLINE, WD_COLOR_INDEX
 load_dotenv()
 
 # Import robust format preservation
@@ -995,8 +995,173 @@ def split_text_by_case_boundaries(text: str) -> List[Tuple[int, int]]:
     return segments if len(segments) > 1 else [(0, len(text))]
 
 
+def build_character_font_mapping(para) -> List[Dict]:
+    """
+    Build a character-position-to-font mapping from paragraph runs.
+    Returns list of font info for each character position in the original text.
+    
+    Captures ALL font attributes to match robust formatting:
+    - Basic: bold, italic, underline
+    - Font: name, size, color, highlight
+    - Advanced: strike, double_strike, subscript, superscript
+    - Effects: all_caps, small_caps, shadow, emboss, imprint, outline
+    """
+    font_mapping = []
+    char_pos = 0
+    
+    for run_idx, run in enumerate(para.runs):
+        run_text = run.text
+        
+        # Extract ALL font properties once per run for efficiency
+        font_props = {
+            # Basic formatting
+            'font_name': run.font.name,
+            'font_size': run.font.size,
+            'bold': run.bold,
+            'italic': run.italic,
+            'underline': run.underline,
+            
+            # Strike/line effects
+            'strike': run.font.strike,
+            'double_strike': run.font.double_strike,
+            
+            # Position effects
+            'subscript': run.font.subscript,
+            'superscript': run.font.superscript,
+            
+            # Color
+            'font_color': None,
+            'highlight_color': None,
+            
+            # Text transform
+            'all_caps': run.font.all_caps,
+            'small_caps': run.font.small_caps,
+            
+            # Visual effects
+            'shadow': run.font.shadow,
+            'emboss': run.font.emboss,
+            'imprint': run.font.imprint,
+            'outline': run.font.outline,
+            
+            # Run tracking
+            'run_index': run_idx
+        }
+        
+        # Extract font color safely
+        try:
+            if run.font.color and run.font.color.rgb:
+                rgb_val = run.font.color.rgb
+                if hasattr(rgb_val, '__int__'):
+                    font_props['font_color'] = int(rgb_val)
+                elif isinstance(rgb_val, (int, float)):
+                    font_props['font_color'] = int(rgb_val)
+            elif run.font.color and run.font.color.theme_color:
+                font_props['font_color'] = f"theme:{run.font.color.theme_color}"
+        except Exception:
+            pass
+        
+        # Extract highlight color safely
+        try:
+            if run.font.highlight_color:
+                font_props['highlight_color'] = str(run.font.highlight_color)
+        except Exception:
+            pass
+        
+        # Map each character to these font properties
+        for i, char in enumerate(run_text):
+            char_info = font_props.copy()
+            char_info['char'] = char
+            char_info['position'] = char_pos
+            font_mapping.append(char_info)
+            char_pos += 1
+    
+    return font_mapping
+
+
+def apply_font_to_run(run, font_info: Dict):
+    """
+    Apply ALL font properties to a run - matches robust formatting coverage.
+    
+    Handles: basic formatting, font properties, colors, effects, and text transforms.
+    """
+    if not font_info:
+        return
+    
+    # === BASIC FORMATTING ===
+    if font_info.get('font_name'):
+        run.font.name = font_info['font_name']
+    if font_info.get('font_size'):
+        run.font.size = font_info['font_size']
+    if font_info.get('bold') is not None:
+        run.bold = font_info['bold']
+    if font_info.get('italic') is not None:
+        run.italic = font_info['italic']
+    if font_info.get('underline') is not None:
+        run.underline = font_info['underline']
+    
+    # === STRIKE/LINE EFFECTS ===
+    if font_info.get('strike') is not None:
+        run.font.strike = font_info['strike']
+    if font_info.get('double_strike') is not None:
+        run.font.double_strike = font_info['double_strike']
+    
+    # === POSITION EFFECTS ===
+    if font_info.get('subscript') is not None:
+        run.font.subscript = font_info['subscript']
+    if font_info.get('superscript') is not None:
+        run.font.superscript = font_info['superscript']
+    
+    # === COLOR ===
+    font_color = font_info.get('font_color')
+    if font_color is not None:
+        try:
+            if isinstance(font_color, str) and font_color.startswith('theme:'):
+                # Theme color - skip (requires special handling)
+                pass
+            elif isinstance(font_color, (int, float)):
+                rgb_int = int(font_color)
+                if 0 <= rgb_int <= 16777215:  # Valid RGB range
+                    run.font.color.rgb = RGBColor(
+                        (rgb_int >> 16) & 0xFF,
+                        (rgb_int >> 8) & 0xFF,
+                        rgb_int & 0xFF
+                    )
+        except Exception:
+            pass
+    
+    highlight_color = font_info.get('highlight_color')
+    if highlight_color is not None:
+        try:
+            # Highlight color is an enum value
+            if hasattr(WD_COLOR_INDEX, str(highlight_color).upper()):
+                run.font.highlight_color = getattr(WD_COLOR_INDEX, str(highlight_color).upper())
+            elif isinstance(highlight_color, int):
+                run.font.highlight_color = highlight_color
+        except Exception:
+            pass
+    
+    # === TEXT TRANSFORM ===
+    if font_info.get('all_caps') is not None:
+        run.font.all_caps = font_info['all_caps']
+    if font_info.get('small_caps') is not None:
+        run.font.small_caps = font_info['small_caps']
+    
+    # === VISUAL EFFECTS ===
+    if font_info.get('shadow') is not None:
+        run.font.shadow = font_info['shadow']
+    if font_info.get('emboss') is not None:
+        run.font.emboss = font_info['emboss']
+    if font_info.get('imprint') is not None:
+        run.font.imprint = font_info['imprint']
+    if font_info.get('outline') is not None:
+        run.font.outline = font_info['outline']
+
+
 def apply_smart_formatting(para, translation: str, original: str):
-    """Smart format application based on run analysis - optimized for different complexity levels"""
+    """
+    Smart format application based on run analysis - optimized for different complexity levels.
+    Preserves font properties (family, size, bold, italic, underline) by character position.
+    """
     
     # CRITICAL: Remove any markers that might have leaked through
     # Remove ALL delimiter markers (catches any variations including translated ones like <<<TRANULATION_1_END>>>)
@@ -1009,103 +1174,135 @@ def apply_smart_formatting(para, translation: str, original: str):
         para.add_run(translation)
         return
     
+    # Build character-to-font mapping from original text
+    original_font_mapping = build_character_font_mapping(para)
+    
+    if not original_font_mapping:
+        # No font mapping available - fallback to simple replacement
+        if para.runs:
+            para.runs[0].text = translation
+            for run in para.runs[1:]:
+                run.text = ""
+        else:
+            para.add_run(translation)
+        return
+    
     # Analyze run complexity
     run_count = len([r for r in para.runs if r.text.strip()])
     
-    # NEW: Check for case changes in original text and handle them specially
-    if detect_case_change_in_text(original) and run_count <= 4:
-        # Split both original and translation by case boundaries
-        original_segments = split_text_by_case_boundaries(original)
-        translation_segments = split_text_by_case_boundaries(translation)
-        
-        # Extract actual text segments
-        original_text_segments = [original[start:end] for start, end in original_segments]
-        translation_text_segments = [translation[start:end] for start, end in translation_segments]
-        
-        # If we have matching number of segments and enough runs, apply to separate runs
-        if (len(original_text_segments) == len(translation_text_segments) and 
-            len(translation_text_segments) <= run_count and
-            len(translation_text_segments) >= 2):
-            
-            # Clear existing runs
-            for run in para.runs:
-                run.text = ""
-            
-            # Apply each case segment to its own run
-            for i, (run, trans_seg) in enumerate(zip(para.runs[:len(translation_text_segments)], translation_text_segments)):
-                run.text = trans_seg
-                # Add space if not last segment and segments should connect
-                if i < len(translation_text_segments) - 1 and not trans_seg.rstrip().endswith((' ', ',', '.', '!', '?', ';', ':')):
-                    run.text += ' '
-            
-            # Clear remaining runs
-            for run in para.runs[len(translation_text_segments):]:
-                run.text = ""
-            
-            return  # Early return - case splitting handled
+    # NEW: Character-position-based font preservation for all cases
+    # Map translation characters proportionally to original font positions
+    original_len = len(original) if original else 1
+    translation_len = len(translation) if translation else 1
     
-    if run_count <= 1:
-        # Simple case - single format, current implementation is perfect
-        para.runs[0].text = translation
+    # Build translation character-to-font mapping (proportional mapping)
+    translation_font_mapping = []
+    for i, char in enumerate(translation):
+        # Map translation position to original position proportionally
+        original_pos_ratio = i / translation_len if translation_len > 0 else 0
+        original_char_pos = int(original_pos_ratio * original_len)
+        original_char_pos = min(original_char_pos, len(original_font_mapping) - 1) if original_font_mapping else 0
         
-    elif run_count == 2:
-        # Common case: Two-format paragraph (e.g., bold heading + normal text)
-        # Try to preserve the format split proportionally
-        first_run_text = para.runs[0].text
-        second_run_text = para.runs[1].text if len(para.runs) > 1 else ""
+        # Get font info from original mapping at this position
+        if original_char_pos < len(original_font_mapping):
+            font_info = original_font_mapping[original_char_pos].copy()
+            font_info['char'] = char
+            font_info['position'] = i
+        else:
+            # Fallback to last font if out of bounds
+            font_info = original_font_mapping[-1].copy() if original_font_mapping else {}
+            font_info['char'] = char
+            font_info['position'] = i
         
-        if first_run_text and original:
-            # Calculate proportion of first run in original
-            first_run_ratio = len(first_run_text) / len(original)
-            split_point = int(len(translation) * first_run_ratio)
-            
-            # Clear existing runs
-            for run in para.runs:
+        translation_font_mapping.append(font_info)
+    
+    # Group translation characters into runs based on font changes
+    if not translation_font_mapping:
+        # Fallback
+        if para.runs:
+            para.runs[0].text = translation
+            for run in para.runs[1:]:
                 run.text = ""
-            
-            # Apply proportional split
-            para.runs[0].text = translation[:split_point]
-            if len(para.runs) > 1:
-                para.runs[1].text = translation[split_point:]
-            else:
-                # Create second run with same formatting as original
-                new_run = para.add_run(translation[split_point:])
-                
-    elif run_count <= 4:
-        # Moderate complexity - try to preserve major format boundaries
-        # This is a simplified approach that works well for common cases
+        return
+    
+    # Group consecutive characters with same font properties into runs
+    font_runs = []
+    current_run = {
+        'text': '',
+        'font': None,
+        'font_signature': None
+    }
+    
+    for char_info in translation_font_mapping:
+        # Create font signature for comparison - include ALL attributes
+        font_sig = (
+            # Basic
+            char_info.get('font_name'),
+            char_info.get('font_size'),
+            char_info.get('bold'),
+            char_info.get('italic'),
+            char_info.get('underline'),
+            # Strike/line effects
+            char_info.get('strike'),
+            char_info.get('double_strike'),
+            # Position effects
+            char_info.get('subscript'),
+            char_info.get('superscript'),
+            # Color
+            char_info.get('font_color'),
+            char_info.get('highlight_color'),
+            # Text transform
+            char_info.get('all_caps'),
+            char_info.get('small_caps'),
+            # Visual effects
+            char_info.get('shadow'),
+            char_info.get('emboss'),
+            char_info.get('imprint'),
+            char_info.get('outline')
+        )
         
-        # Calculate word distribution
-        total_words = len(original.split())
-        words_per_run = total_words // run_count if run_count > 0 else total_words
-        
-        # Split translation by approximate word count
-        translation_words = translation.split()
-        
-        # Clear existing runs
-        for run in para.runs:
-            run.text = ""
-        
-        # Distribute translation across runs
-        word_index = 0
-        for i, run in enumerate(para.runs[:run_count]):
-            if i == run_count - 1:
-                # Last run gets remaining words
-                run.text = ' '.join(translation_words[word_index:])
-            else:
-                # Calculate words for this run
-                end_index = min(word_index + words_per_run, len(translation_words))
-                run.text = ' '.join(translation_words[word_index:end_index])
-                if i < run_count - 1:
-                    run.text += ' '  # Add space between runs
-                word_index = end_index
-                
-    else:
-        # High complexity - fallback to first run (robust method should handle these)
-        # Clear all runs and put everything in first
-        for run in para.runs:
-            run.text = ""
-        para.runs[0].text = translation
+        if current_run['font_signature'] is None:
+            # First character - start new run
+            current_run['text'] = char_info['char']
+            current_run['font'] = char_info
+            current_run['font_signature'] = font_sig
+        elif font_sig == current_run['font_signature']:
+            # Same font - append to current run
+            current_run['text'] += char_info['char']
+        else:
+            # Font changed - save current run and start new one
+            font_runs.append(current_run)
+            current_run = {
+                'text': char_info['char'],
+                'font': char_info,
+                'font_signature': font_sig
+            }
+    
+    # Add final run
+    if current_run['text']:
+        font_runs.append(current_run)
+    
+    # Clear existing runs
+    for run in para.runs:
+        run.text = ""
+    
+    # Apply font-preserved runs
+    for i, font_run_info in enumerate(font_runs):
+        if i < len(para.runs):
+            # Reuse existing run
+            run = para.runs[i]
+            run.text = font_run_info['text']
+            apply_font_to_run(run, font_run_info['font'])
+        else:
+            # Create new run
+            new_run = para.add_run(font_run_info['text'])
+            apply_font_to_run(new_run, font_run_info['font'])
+    
+    # Clear any extra runs
+    while len(para.runs) > len(font_runs):
+        para._p.remove(para.runs[-1]._element)
+    
+    return  # Character-based font mapping applied - all font properties preserved
 
 def call_gemini_batch_api(client, prompt, model, logs=None):
     """
@@ -2099,13 +2296,8 @@ async def translate_document_content_async_openrouter(file_bytes: bytes, file_na
                         translation = sanitize_response(translation)
                         translated_content.append(translation)
                         
-                        # Update paragraph text in memory
-                        for run in para.runs:
-                            run.text = ""
-                        if para.runs:
-                            para.runs[0].text = translation
-                        else:
-                            para.add_run(translation)
+                        # Update paragraph text with smart formatting (preserves ALL font attributes)
+                        apply_smart_formatting(para, translation, original)
                         
                         # Normalize copyright paragraphs - remove extra indentation
                         stripped_text = para.text.strip().lower()
