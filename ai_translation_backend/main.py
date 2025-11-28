@@ -743,10 +743,54 @@ def is_meaningful_text(text):
     cleaned = re.sub(r'[\W_]+', '', text)
     return bool(cleaned.strip())
 
+def is_section_number(text):
+    """
+    Check if text is a section/stanza number (Roman numeral or Arabic number).
+    These should NOT be filtered out as they are meaningful content.
+    """
+    stripped = text.strip().upper()
+    original_text = text.strip()
+    
+    # Check for Roman numerals (explicit list for common ones)
+    roman_numerals = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X',
+                      'XI', 'XII', 'XIII', 'XIV', 'XV', 'XVI', 'XVII', 'XVIII', 'XIX', 'XX',
+                      'XXI', 'XXII', 'XXIII', 'XXIV', 'XXV', 'XXX', 'XL', 'L', 'LX', 'LXX',
+                      'LXXX', 'XC', 'C', 'CC', 'CCC', 'CD', 'D', 'DC', 'DCC', 'DCCC', 'CM', 'M']
+    if stripped in roman_numerals:
+        print(f"[ROMAN DETECT] Paragraph text '{original_text}' (stripped: '{stripped}') detected as Roman numeral section number - NOT filtering out")
+        return True
+    
+    # Also check if it matches Roman numeral pattern
+    if re.fullmatch(r'[IVXLCDM]+', stripped):
+        print(f"[ROMAN DETECT] Paragraph text '{original_text}' (stripped: '{stripped}') matches Roman numeral pattern - NOT filtering out")
+        return True
+    
+    # Check for Arabic numbers (section/stanza numbers like "2", "3", "10", etc.)
+    if re.fullmatch(r'\d+', original_text.strip()):
+        print(f"[SECTION NUMBER] Paragraph text '{original_text}' detected as Arabic section number - NOT filtering out")
+        return True
+    
+    return False
+
 def is_decorative_only(text):
-    """Check if text is decorative only (symbols, single letters, etc.)"""
-    stripped = text.strip()
-    return not stripped or re.fullmatch(r"[^\w\s]+", stripped) or re.fullmatch(r"[A-Z]", stripped)
+    """
+    Check if text is decorative only (symbols, single letters, etc.)
+    IMPORTANT: Does NOT filter out Roman numerals (I, V, X, II, III, etc.) or Arabic numbers as they are section/stanza numbers
+    """
+    stripped = text.strip().upper()
+    original_text = text.strip()
+    
+    # Don't filter out section/stanza numbers
+    if is_section_number(text):
+        return False  # This is a section number, not decorative
+    
+    # Now check for decorative text
+    symbols_only = bool(re.fullmatch(r"[^\w\s]+", text.strip()))
+    single_letter = bool(re.fullmatch(r"[A-Z]", text.strip()))
+    is_decorative = not stripped or symbols_only or single_letter
+    if is_decorative and len(text.strip()) <= 3:
+        print(f"[DECORATIVE CHECK] Text '{original_text}' marked as decorative: empty={not stripped}, symbols_only={symbols_only}, single_letter={single_letter}")
+    return is_decorative
 
 
 def preview_text(text: str, limit: int = 200) -> str:
@@ -783,6 +827,212 @@ def remove_delimiter_markers(text: str) -> str:
     
     return text
 
+def roman_to_arabic(roman: str) -> int:
+    """Convert a Roman numeral string to Arabic integer."""
+    roman = roman.upper()
+    roman_values = {
+        'I': 1, 'V': 5, 'X': 10, 'L': 50,
+        'C': 100, 'D': 500, 'M': 1000
+    }
+    result = 0
+    prev_value = 0
+    
+    for char in reversed(roman):
+        if char not in roman_values:
+            return None  # Invalid Roman numeral
+        value = roman_values[char]
+        if value < prev_value:
+            result -= value
+        else:
+            result += value
+        prev_value = value
+    
+    return result
+
+
+def convert_roman_numerals(text: str) -> str:
+    """
+    Post-processing function to convert Roman numerals to Arabic numerals.
+    This catches any Roman numerals the AI missed during translation.
+    
+    Handles:
+    - Standalone Roman numerals at start of line/paragraph (section numbers)
+    - Roman numerals after prefixes: "Chapter III" -> "Chapter 3"
+    - Year formats: "MDCCLXXVI" -> "1776"
+    - Roman numerals in parentheses: (IV) -> (4)
+    
+    CRITICAL: Single-letter "I" is both a Roman numeral AND an English pronoun.
+    We ONLY convert it when the text is EXACTLY "I" with no other content (section number).
+    If there's trailing space like "I " or other words, it's likely the pronoun, not a numeral.
+    """
+    if not text:
+        return text
+    
+    original_text = text
+    
+    # FIRST: Check if entire text is just a Roman numeral (most common case for section numbers)
+    # Handle both uppercase and lowercase - THIS IS THE PRIMARY CHECK
+    stripped = text.strip().upper()
+    leading_ws = text[:len(text) - len(text.lstrip())]
+    trailing_ws = text[len(text.rstrip()):]
+    
+    # EXPLICIT handling for single Roman numerals that are common section numbers
+    # This MUST be checked first because single letters like I, V, X are often missed
+    single_roman_map = {
+        'I': '1', 'II': '2', 'III': '3', 'IV': '4', 'V': '5',
+        'VI': '6', 'VII': '7', 'VIII': '8', 'IX': '9', 'X': '10',
+        'XI': '11', 'XII': '12', 'XIII': '13', 'XIV': '14', 'XV': '15',
+        'XVI': '16', 'XVII': '17', 'XVIII': '18', 'XIX': '19', 'XX': '20'
+    }
+    
+    # CRITICAL FIX: For single-letter Romans (I, V, X), distinguish between:
+    # - Section number: "I" or "I\n" (standalone, no trailing space before content ends)
+    # - English pronoun: "I " (followed by space, indicates more words follow like "I thought")
+    if stripped in ['I', 'V', 'X']:
+        text_trimmed = text.strip()
+        if text_trimmed.upper() == stripped:
+            # Check for trailing SPACE (not newline) - space indicates more content follows
+            # "I " = pronoun (space before next word)
+            # "I" or "I\n" = section number (standalone)
+            text_without_newlines = text.rstrip('\n\r')
+            has_trailing_space = text_without_newlines != text_without_newlines.rstrip(' \t')
+            
+            if has_trailing_space:
+                # Trailing space before end = likely "I [word]" = pronoun, don't convert
+                print(f"[ROMAN SKIP] Not converting '{repr(text)}' - has trailing space, likely pronoun")
+                return text
+            else:
+                # No trailing space = standalone section number, convert
+                print(f"[ROMAN CONVERT] Converting standalone '{stripped}' to '{single_roman_map[stripped]}'")
+                return leading_ws + single_roman_map[stripped] + trailing_ws
+        # Text doesn't match expected pattern
+        return text
+    
+    # For multi-letter Romans (II, III, IV, etc.), safe to convert
+    if stripped in single_roman_map:
+        result = leading_ws + single_roman_map[stripped] + trailing_ws
+        print(f"[ROMAN CONVERT] '{text.strip()}' → '{single_roman_map[stripped]}' (via explicit map)")
+        return result
+    
+    # Fallback: Check if it's a valid Roman numeral pattern (for larger numerals, must be > 1 char)
+    if stripped and re.fullmatch(r'[IVXLCDM]+', stripped) and len(stripped) > 1:
+        arabic = roman_to_arabic(stripped)
+        if arabic is not None and arabic > 0 and arabic <= 100:  # Reasonable section number
+            # Preserve leading/trailing whitespace
+            leading_ws = text[:len(text) - len(text.lstrip())]
+            trailing_ws = text[len(text.rstrip()):]
+            return leading_ws + str(arabic) + trailing_ws
+    
+    # Pattern for single Roman numerals (I, V, X) at start of text followed by newline
+    # These are typically stanza/section numbers
+    single_start_pattern = r'^([IVX]+)\s*\n'
+    
+    def replace_single_start(match):
+        roman = match.group(1)
+        arabic = roman_to_arabic(roman)
+        if arabic is not None and arabic > 0 and arabic <= 50:  # Reasonable for single letters
+            return f"{arabic}\n"
+        return match.group(0)
+    
+    text = re.sub(single_start_pattern, replace_single_start, text, flags=re.MULTILINE)
+    
+    # Pattern for Roman numerals after newline and before newline (standalone line)
+    # This catches: "\nV\n" or "\nX\n" or "\nIII\n"
+    newline_pattern = r'\n([IVXLCDM]+)\s*\n'
+    
+    def replace_newline(match):
+        roman = match.group(1)
+        arabic = roman_to_arabic(roman)
+        if arabic is not None and arabic > 0 and arabic <= 100:
+            return f"\n{arabic}\n"
+        return match.group(0)
+    
+    text = re.sub(newline_pattern, replace_newline, text)
+    
+    # Pattern for Roman numerals after common prefixes
+    prefix_pattern = r'\b(Chapter|Part|Section|Volume|Book|Act|Scene|Article|Paragraph|Verse|Page|No\.|Number|Fig\.|Figure|Table|Appendix|Item|Entry|Lesson|Unit|Module|Grade|Level|Class|Form|Year|Series|Episode|Season|Stanza)\s+([IVXLCDM]+)\b'
+    
+    def replace_with_prefix(match):
+        prefix = match.group(1)
+        roman = match.group(2)
+        arabic = roman_to_arabic(roman)
+        if arabic is not None and arabic > 0:
+            return f"{prefix} {arabic}"
+        return match.group(0)
+    
+    text = re.sub(prefix_pattern, replace_with_prefix, text, flags=re.IGNORECASE)
+    
+    # Pattern for standalone large Roman numerals (likely years: MDCCLXXVI = 1776)
+    large_roman_pattern = r'\b([MDCLXVI]{4,})\b'
+    
+    def replace_large_roman(match):
+        roman = match.group(1)
+        arabic = roman_to_arabic(roman)
+        if arabic is not None and arabic > 0:
+            return str(arabic)
+        return match.group(0)
+    
+    text = re.sub(large_roman_pattern, replace_large_roman, text)
+    
+    # Pattern for Roman numerals after common ordinal words
+    ordinal_pattern = r'\b(the|a|an)\s+([IVXLCDM]{2,})(st|nd|rd|th)?\b'
+    
+    def replace_ordinal(match):
+        article = match.group(1)
+        roman = match.group(2)
+        suffix = match.group(3) or ''
+        arabic = roman_to_arabic(roman)
+        if arabic is not None and arabic > 0:
+            return f"{article} {arabic}{suffix}"
+        return match.group(0)
+    
+    text = re.sub(ordinal_pattern, replace_ordinal, text, flags=re.IGNORECASE)
+    
+    # Pattern for Roman numerals in parentheses: (III) -> (3)
+    paren_pattern = r'\(([IVXLCDM]+)\)'
+    
+    def replace_paren(match):
+        roman = match.group(1)
+        arabic = roman_to_arabic(roman)
+        if arabic is not None and arabic > 0:
+            return f"({arabic})"
+        return match.group(0)
+    
+    text = re.sub(paren_pattern, replace_paren, text)
+    
+    # Pattern for Roman numerals with periods: III. -> 3.
+    period_pattern = r'\b([IVXLCDM]{2,})\.'
+    
+    def replace_period(match):
+        roman = match.group(1)
+        arabic = roman_to_arabic(roman)
+        if arabic is not None and arabic > 0:
+            return f"{arabic}."
+        return match.group(0)
+    
+    text = re.sub(period_pattern, replace_period, text)
+    
+    # Pattern for standalone Roman numerals on their own line (paragraph is just "V" or "X")
+    # This handles cases where the entire text/paragraph is just a Roman numeral
+    if text.strip() in ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 
+                        'XI', 'XII', 'XIII', 'XIV', 'XV', 'XVI', 'XVII', 'XVIII', 'XIX', 'XX',
+                        'XXI', 'XXII', 'XXIII', 'XXIV', 'XXV', 'XXX', 'XL', 'L', 'LX', 'LXX',
+                        'LXXX', 'XC', 'C', 'CC', 'CCC', 'CD', 'D', 'DC', 'DCC', 'DCCC', 'CM', 'M']:
+        arabic = roman_to_arabic(text.strip())
+        if arabic is not None and arabic > 0:
+            # Preserve whitespace around the numeral
+            leading = len(text) - len(text.lstrip())
+            trailing = len(text) - len(text.rstrip())
+            result = text[:leading] + str(arabic) + text[len(text)-trailing:] if trailing else text[:leading] + str(arabic)
+            print(f"[ROMAN CONVERT] Entire text '{original_text.strip()}' → '{arabic}' (standalone check)")
+            return result
+    
+    if original_text != text:
+        print(f"[ROMAN CONVERT] Text changed: '{original_text[:50]}...' → '{text[:50]}...'")
+    
+    return text
+
+
 def sanitize_response(text: str) -> str:
     """Remove AI artifacts but PRESERVE all whitespace and robust formatting tags."""
     if not text:
@@ -796,6 +1046,8 @@ def sanitize_response(text: str) -> str:
     text = re.sub(r'</untranslated>', '', text, flags=re.IGNORECASE)
     # Remove ALL delimiter markers (comprehensive removal - catches translated/misspelled variants)
     text = remove_delimiter_markers(text)
+    # Convert any remaining Roman numerals to Arabic numerals (post-processing safety net)
+    text = convert_roman_numerals(text)
     # DO NOT remove robust formatting markers ««...»» - they need to be preserved!
     # The robust formatter will parse and remove them when applying formatting to the document
     # text = re.sub(r'««[^»]+»»', '', text)  # REMOVED - preserve robust formatting tags
@@ -1648,25 +1900,32 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
         # CRITICAL: Do NOT strip - preserve ALL whitespace including indentation
         original = para.text  # Keep exact formatting
 
-
-        # Skip single uppercase letters followed by uppercase text (but don't remove them!)
-        if re.fullmatch(r"[A-Z]", original) and i + 1 < len(paragraphs) and paragraphs[i + 1].text.strip()[:1].isupper():
-            i += 1
-            continue
-
-        # Skip empty or decorative text (check stripped version)
-        if not original.strip() or not is_meaningful_text(original) or is_decorative_only(original):
-            i += 1
-            continue
-
-        word_count = len(original.strip().split())
-        is_heading = (para.style is not None and para.style.name.lower().startswith("heading")) or para.alignment == 1
-
-        # Skip single-word non-heading paragraphs
-        if word_count <= 1:
-            if not original.strip().isupper() and not is_heading:
+        # CRITICAL: Check for section/stanza numbers FIRST - these should NOT be filtered out
+        is_section_num = is_section_number(original)
+        if is_section_num:
+            # This is a section number (Roman or Arabic) - include it in translation
+            print(f"[INCLUDE SECTION] Para {i}: '{original.strip()}' is a section number - NOT filtering")
+            logs.append(f"[INCLUDE] Para {i} is a section number: '{original.strip()}'")
+            # DON'T skip - section numbers must be translated to convert I->1, V->5, etc.
+        else:
+            # Skip single uppercase letters followed by uppercase text (but don't remove them!)
+            if re.fullmatch(r"[A-Z]", original) and i + 1 < len(paragraphs) and paragraphs[i + 1].text.strip()[:1].isupper():
                 i += 1
                 continue
+
+            # Skip empty or decorative text (check stripped version)
+            if not original.strip() or not is_meaningful_text(original) or is_decorative_only(original):
+                i += 1
+                continue
+
+            word_count = len(original.strip().split())
+            is_heading = (para.style is not None and para.style.name.lower().startswith("heading")) or para.alignment == 1
+
+            # Skip single-word non-heading paragraphs
+            if word_count <= 1:
+                if not original.strip().isupper() and not is_heading:
+                    i += 1
+                    continue
 
         total_paragraphs_to_translate += 1
         
@@ -2143,25 +2402,32 @@ async def translate_document_content_async_openrouter(file_bytes: bytes, file_na
         # CRITICAL: Do NOT strip - preserve ALL whitespace including indentation
         original = para.text  # Keep exact formatting
 
-        # Skip single uppercase letters followed by uppercase text (but don't remove them!)
-        if re.fullmatch(r"[A-Z]", original) and i + 1 < len(paragraphs) and paragraphs[i + 1].text.strip()[:1].isupper():
-            logs.append(f"[SKIP] Skipping single uppercase letter at para {i} (preserving structure)")
-            i += 1
-            continue
-
-        # Skip empty or decorative text (check stripped version)
-        if not original.strip() or not is_meaningful_text(original) or is_decorative_only(original):
-            i += 1
-            continue
-
-        word_count = len(original.strip().split())
-        is_heading = (para.style is not None and para.style.name.lower().startswith("heading")) or para.alignment == 1
-
-        # Skip single-word non-heading paragraphs
-        if word_count <= 1:
-            if not original.strip().isupper() and not is_heading:
+        # CRITICAL: Check for section/stanza numbers FIRST - these should NOT be filtered out
+        is_section_num = is_section_number(original)
+        if is_section_num:
+            # This is a section number (Roman or Arabic) - include it in translation
+            logs.append(f"[INCLUDE] Paragraph {i} is a section number: '{original.strip()}' - including in translation")
+            # DON'T skip - section numbers must be translated
+        else:
+            # Skip single uppercase letters followed by uppercase text (but don't remove them!)
+            if re.fullmatch(r"[A-Z]", original) and i + 1 < len(paragraphs) and paragraphs[i + 1].text.strip()[:1].isupper():
+                logs.append(f"[SKIP] Skipping single uppercase letter at para {i} (preserving structure)")
                 i += 1
                 continue
+
+            # Skip empty or decorative text (check stripped version)
+            if not original.strip() or not is_meaningful_text(original) or is_decorative_only(original):
+                i += 1
+                continue
+
+            word_count = len(original.strip().split())
+            is_heading = (para.style is not None and para.style.name.lower().startswith("heading")) or para.alignment == 1
+
+            # Skip single-word non-heading paragraphs
+            if word_count <= 1:
+                if not original.strip().isupper() and not is_heading:
+                    i += 1
+                    continue
 
         # SMART BATCHING: Get optimal batch size for this content
         optimal_size = get_smart_batch_size(original)
@@ -2399,13 +2665,26 @@ async def translate_document_content_async_robust(
     
     para_count = 0
     for i, para in enumerate(doc.paragraphs):
+        para_text = para.text.strip()
+        
+        # DEBUG: Log ALL paragraphs to see what we're working with
+        if len(para_text) <= 5:
+            print(f"[DEBUG PARA] Para {i}: '{para_text}' (len={len(para_text)})")
+        
         # Skip empty paragraphs
-        if not para.text.strip():
+        if not para_text:
             continue
         
-        # Skip decorative paragraphs
-        if not is_meaningful_text(para.text.strip()) or is_decorative_only(para.text.strip()):
-            continue
+        # CRITICAL: Check for section/stanza numbers FIRST - these should NOT be filtered out
+        is_section_num = is_section_number(para.text)
+        if is_section_num:
+            # This is a section number (Roman or Arabic) - include it in translation
+            print(f"[INCLUDE] Paragraph {i} is a section number: '{para.text.strip()}' - including in robust translation")
+            # DON'T filter - skip the decorative check below
+        else:
+            # Skip decorative paragraphs (but NOT section numbers!)
+            if not is_meaningful_text(para.text.strip()) or is_decorative_only(para.text.strip()):
+                continue
         
         # Extract formatting and create marked text
         marked_text, para_data = preserver.create_formatted_text_for_translation(para, para_count)
@@ -2823,6 +3102,37 @@ You are a professional translator. Translate {count} passage(s) into {language}.
   * "Part III" → "Part 3"
   * "Volume XIV" → "Volume 14"
   * "Year MDCCLXXVI" → "Year 1776"
+
+**🔴 CRITICAL: STANDALONE ROMAN NUMERALS (SECTION/STANZA NUMBERS):**
+- **MOST IMPORTANT**: When you see a standalone Roman numeral on its own line or at the start of a paragraph, it is ALWAYS a section/stanza number, NOT an English letter
+- **Examples that MUST be converted:**
+  * A paragraph containing ONLY "I" → Convert to "1" (NOT the English letter "I")
+  * A paragraph containing ONLY "V" → Convert to "5" (NOT the English letter "V")
+  * A paragraph containing ONLY "X" → Convert to "10" (NOT the English letter "X")
+  * A paragraph containing ONLY "III" → Convert to "3"
+  * A paragraph containing ONLY "VII" → Convert to "7"
+- **How to recognize standalone Roman numerals:**
+  * They appear alone on their own line (preceded by newline, followed by newline)
+  * They appear at the very start of a paragraph (first thing on the line)
+  * They are NOT part of a word (like "I" in "I went to the store")
+  * They are NOT part of a sentence (like "V" in "V for Victory")
+- **When in doubt**: If a Roman numeral (I, V, X, etc.) appears standalone on its own line or at paragraph start, it's 99% likely a section number and should be converted
+- **Rule of thumb**: I, V, X alone on a line = section/stanza number = convert to 1, 5, 10
+
+**🚫 CRITICAL WARNING - DO NOT CONVERT THE ENGLISH PRONOUN "I":**
+- The letter "I" is ALSO the English first-person pronoun (meaning "me" or "myself")
+- **NEVER convert "I" to "1" when it's the English pronoun!**
+- **Examples that MUST NOT be converted:**
+  * "I thought" → KEEP as "I thought" (NOT "1 thought")
+  * "I went to the store" → KEEP as "I went to the store" (NOT "1 went to the store")
+  * "I am happy" → KEEP as "I am happy" (NOT "1 am happy")
+  * "I love you" → KEEP as "I love you" (NOT "1 love you")
+- **How to recognize the English pronoun "I":**
+  * It's followed by a verb (thought, went, am, was, have, will, etc.)
+  * It's part of a sentence, not standing alone
+  * It appears with other words in the same run/paragraph
+- **ONLY convert "I" to "1" when it's COMPLETELY STANDALONE** (the entire paragraph is just "I" with nothing else)
+
 - When translating to modern English (8th grade level), use modern Arabic numerals exclusively
 - Do NOT preserve Roman numerals in modern English translations
 - Convert ordinal Roman numerals: "1st" (not "Ist"), "2nd" (not "IInd"), "3rd" (not "IIIrd"), "4th" (not "IVth")

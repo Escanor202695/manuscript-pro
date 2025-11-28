@@ -61,6 +61,180 @@ def _safe_float(value):
         return None
 
 
+def _roman_to_arabic(roman: str) -> int:
+    """Convert a Roman numeral string to Arabic integer."""
+    roman = roman.upper()
+    roman_values = {
+        'I': 1, 'V': 5, 'X': 10, 'L': 50,
+        'C': 100, 'D': 500, 'M': 1000
+    }
+    result = 0
+    prev_value = 0
+    
+    for char in reversed(roman):
+        if char not in roman_values:
+            return None
+        value = roman_values[char]
+        if value < prev_value:
+            result -= value
+        else:
+            result += value
+        prev_value = value
+    
+    return result
+
+
+def convert_roman_numerals_in_text(text: str) -> str:
+    """
+    Post-processing: Convert Roman numerals to Arabic numerals.
+    Safety net for any Roman numerals the AI missed.
+    
+    CRITICAL: Single-letter "I" is both a Roman numeral AND an English pronoun.
+    We ONLY convert it when the text is EXACTLY "I" with no other content (section number).
+    If there's trailing space like "I " or other words, it's likely the pronoun, not a numeral.
+    """
+    if not text:
+        return text
+    
+    # FIRST: Check if entire text is just a Roman numeral (most common case for section numbers)
+    # Handle both uppercase and lowercase - THIS IS THE PRIMARY CHECK
+    stripped = text.strip().upper()
+    
+    # EXPLICIT handling for single Roman numerals that are common section numbers
+    # This MUST be checked first because single letters like I, V, X are often missed
+    single_roman_map = {
+        'I': '1', 'II': '2', 'III': '3', 'IV': '4', 'V': '5',
+        'VI': '6', 'VII': '7', 'VIII': '8', 'IX': '9', 'X': '10',
+        'XI': '11', 'XII': '12', 'XIII': '13', 'XIV': '14', 'XV': '15',
+        'XVI': '16', 'XVII': '17', 'XVIII': '18', 'XIX': '19', 'XX': '20'
+    }
+    
+    # CRITICAL FIX: For single-letter Romans (I, V, X), distinguish between:
+    # - Section number: "I" or "I\n" (standalone, no trailing space before content ends)
+    # - English pronoun: "I " (followed by space, indicates more words follow like "I thought")
+    if stripped in ['I', 'V', 'X']:
+        text_trimmed = text.strip()
+        if text_trimmed.upper() == stripped:
+            # Check for trailing SPACE (not newline) - space indicates more content follows
+            # "I " = pronoun (space before next word)
+            # "I" or "I\n" = section number (standalone)
+            text_without_newlines = text.rstrip('\n\r')
+            has_trailing_space = text_without_newlines != text_without_newlines.rstrip(' \t')
+            
+            if has_trailing_space:
+                # Trailing space before end = likely "I [word]" = pronoun, don't convert
+                print(f"[ROMAN SKIP] Not converting '{repr(text)}' - has trailing space, likely pronoun")
+                return text
+            else:
+                # No trailing space = standalone section number, convert
+                leading_ws = text[:len(text) - len(text.lstrip())]
+                trailing_ws = text[len(text.rstrip()):]
+                print(f"[ROMAN CONVERT] Converting standalone '{stripped}' to '{single_roman_map[stripped]}'")
+                return leading_ws + single_roman_map[stripped] + trailing_ws
+        # Text doesn't match expected pattern
+        return text
+    
+    # For multi-letter Romans (II, III, IV, etc.), safe to convert
+    if stripped in single_roman_map:
+        leading_ws = text[:len(text) - len(text.lstrip())]
+        trailing_ws = text[len(text.rstrip()):]
+        return leading_ws + single_roman_map[stripped] + trailing_ws
+    
+    # Fallback: Check if it's a valid Roman numeral pattern (for larger numerals)
+    if stripped and re.fullmatch(r'[IVXLCDM]+', stripped) and len(stripped) > 1:
+        arabic = _roman_to_arabic(stripped)
+        if arabic is not None and arabic > 0 and arabic <= 100:
+            leading_ws = text[:len(text) - len(text.lstrip())]
+            trailing_ws = text[len(text.rstrip()):]
+            return leading_ws + str(arabic) + trailing_ws
+    
+    # Pattern for single Roman numerals (I, V, X) at start of text followed by newline
+    single_start_pattern = r'^([IVX]+)\s*\n'
+    
+    def replace_single_start(match):
+        roman = match.group(1)
+        arabic = _roman_to_arabic(roman)
+        if arabic is not None and arabic > 0 and arabic <= 50:
+            return f"{arabic}\n"
+        return match.group(0)
+    
+    text = re.sub(single_start_pattern, replace_single_start, text, flags=re.MULTILINE)
+    
+    # Pattern for Roman numerals after newline and before newline (standalone line)
+    newline_pattern = r'\n([IVXLCDM]+)\s*\n'
+    
+    def replace_newline(match):
+        roman = match.group(1)
+        arabic = _roman_to_arabic(roman)
+        if arabic is not None and arabic > 0 and arabic <= 100:
+            return f"\n{arabic}\n"
+        return match.group(0)
+    
+    text = re.sub(newline_pattern, replace_newline, text)
+    
+    # Pattern for Roman numerals after common prefixes
+    prefix_pattern = r'\b(Chapter|Part|Section|Volume|Book|Act|Scene|Article|Paragraph|Verse|Page|No\.|Number|Fig\.|Figure|Table|Appendix|Item|Entry|Lesson|Unit|Module|Grade|Level|Class|Form|Year|Series|Episode|Season|Stanza)\s+([IVXLCDM]+)\b'
+    
+    def replace_with_prefix(match):
+        prefix = match.group(1)
+        roman = match.group(2)
+        arabic = _roman_to_arabic(roman)
+        if arabic is not None and arabic > 0:
+            return f"{prefix} {arabic}"
+        return match.group(0)
+    
+    text = re.sub(prefix_pattern, replace_with_prefix, text, flags=re.IGNORECASE)
+    
+    # Pattern for standalone large Roman numerals (likely years)
+    large_roman_pattern = r'\b([MDCLXVI]{4,})\b'
+    
+    def replace_large_roman(match):
+        roman = match.group(1)
+        arabic = _roman_to_arabic(roman)
+        if arabic is not None and arabic > 0:
+            return str(arabic)
+        return match.group(0)
+    
+    text = re.sub(large_roman_pattern, replace_large_roman, text)
+    
+    # Pattern for Roman numerals in parentheses
+    paren_pattern = r'\(([IVXLCDM]+)\)'
+    
+    def replace_paren(match):
+        roman = match.group(1)
+        arabic = _roman_to_arabic(roman)
+        if arabic is not None and arabic > 0:
+            return f"({arabic})"
+        return match.group(0)
+    
+    text = re.sub(paren_pattern, replace_paren, text)
+    
+    # Pattern for Roman numerals with periods
+    period_pattern = r'\b([IVXLCDM]{2,})\.'
+    
+    def replace_period(match):
+        roman = match.group(1)
+        arabic = _roman_to_arabic(roman)
+        if arabic is not None and arabic > 0:
+            return f"{arabic}."
+        return match.group(0)
+    
+    text = re.sub(period_pattern, replace_period, text)
+    
+    # Handle case where entire text is just a Roman numeral
+    if text.strip() in ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 
+                        'XI', 'XII', 'XIII', 'XIV', 'XV', 'XVI', 'XVII', 'XVIII', 'XIX', 'XX',
+                        'XXI', 'XXII', 'XXIII', 'XXIV', 'XXV', 'XXX', 'XL', 'L', 'LX', 'LXX',
+                        'LXXX', 'XC', 'C', 'CC', 'CCC', 'CD', 'D', 'DC', 'DCC', 'DCCC', 'CM', 'M']:
+        arabic = _roman_to_arabic(text.strip())
+        if arabic is not None and arabic > 0:
+            leading = len(text) - len(text.lstrip())
+            trailing = len(text) - len(text.rstrip())
+            return text[:leading] + str(arabic) + text[len(text)-trailing:] if trailing else text[:leading] + str(arabic)
+    
+    return text
+
+
 @dataclass
 class RunFormatting:
     """Complete formatting information for a run"""
@@ -190,25 +364,27 @@ class RobustFormatPreserver:
         character_spacing = _safe_int(getattr(run.font, 'spacing', None))
         position = _safe_int(getattr(run.font, 'position', None))
 
+        # Ensure boolean values are explicitly True/False, not None
+        # python-docx can return None for unset properties, but we need explicit values
         return RunFormatting(
             text=run.text,
-            bold=run.bold,
-            italic=run.italic,
-            underline=run.underline,
-            strike=run.font.strike,
-            double_strike=run.font.double_strike,
-            subscript=run.font.subscript,
-            superscript=run.font.superscript,
+            bold=bool(run.bold) if run.bold is not None else False,
+            italic=bool(run.italic) if run.italic is not None else False,
+            underline=bool(run.underline) if run.underline is not None else False,
+            strike=bool(run.font.strike) if run.font.strike is not None else False,
+            double_strike=bool(run.font.double_strike) if run.font.double_strike is not None else False,
+            subscript=bool(run.font.subscript) if run.font.subscript is not None else False,
+            superscript=bool(run.font.superscript) if run.font.superscript is not None else False,
             font_name=run.font.name,
             font_size=font_size,
             font_color=font_color,
             highlight_color=highlight_color,
-            all_caps=run.font.all_caps,
-            small_caps=run.font.small_caps,
-            shadow=run.font.shadow,
-            emboss=run.font.emboss,
-            imprint=run.font.imprint,
-            outline=run.font.outline,
+            all_caps=bool(run.font.all_caps) if run.font.all_caps is not None else False,
+            small_caps=bool(run.font.small_caps) if run.font.small_caps is not None else False,
+            shadow=bool(run.font.shadow) if run.font.shadow is not None else False,
+            emboss=bool(run.font.emboss) if run.font.emboss is not None else False,
+            imprint=bool(run.font.imprint) if run.font.imprint is not None else False,
+            outline=bool(run.font.outline) if run.font.outline is not None else False,
             character_spacing=character_spacing,
             position=position
         )
@@ -363,10 +539,24 @@ class RobustFormatPreserver:
         This dramatically reduces run count while preserving exact spacing.
         CRITICAL: run.text already contains spaces, so concatenation preserves spacing perfectly.
         
+        NEW: Whitespace-only runs don't break merging - runs with same formatting merge across whitespace.
         NEW: Also splits on case boundaries to preserve case patterns even when formatting is identical.
         """
         if not para.runs:
             return []
+        
+        def is_whitespace_only(text: str) -> bool:
+            """Check if text contains only whitespace characters"""
+            return not text.strip() and len(text) > 0
+        
+        def is_punctuation_only(text: str) -> bool:
+            """Check if text contains only punctuation and/or whitespace"""
+            import string
+            stripped = text.strip()
+            if not stripped:
+                return True  # Whitespace only
+            # Check if all non-whitespace characters are punctuation
+            return all(c in string.punctuation or c.isspace() for c in stripped)
         
         merged_groups = []
         current_group = {
@@ -378,34 +568,79 @@ class RobustFormatPreserver:
         }
         
         # Track indices as we iterate to avoid index() lookup issues
-        for idx, run in enumerate(para.runs):
+        i = 0
+        while i < len(para.runs):
+            run = para.runs[i]
+            run_text = run.text
+            is_whitespace = is_whitespace_only(run_text)
+            is_punctuation = is_punctuation_only(run_text)
             run_format = self.extract_run_formatting(run)
             format_sig = self._get_format_signature(run_format)
             
+            # Look ahead to see if there are consecutive runs with same formatting separated by punctuation/whitespace
+            # This handles: RUN4(italic) -> RUN5(", ", non-italic) -> RUN6(italic) = should merge to one italic group
+            if current_group['format'] is not None and format_sig != current_group['format']:
+                # Different formatting - check if we can merge across punctuation/whitespace
+                if is_whitespace or is_punctuation:
+                    # This is whitespace or punctuation-only - look ahead to see if next run matches current group format
+                    if i + 1 < len(para.runs):
+                        next_run = para.runs[i + 1]
+                        next_run_format = self.extract_run_formatting(next_run)
+                        next_format_sig = self._get_format_signature(next_run_format)
+                        
+                        if next_format_sig == current_group['format']:
+                            # Next run matches current group - merge punctuation/whitespace and continue
+                            # This allows: italic -> ", " -> italic to merge as one italic group
+                            current_group['runs'].append(run)
+                            current_group['run_indices'].append(i)
+                            current_group['text'] += run_text
+                            i += 1
+                            continue  # Skip to next iteration to process the matching run
+                
+                # Can't merge - save current group and start new one
+                merged_groups.append(current_group)
+                current_group = {
+                    'runs': [],
+                    'run_indices': [],
+                    'text': '',
+                    'format': None,
+                    'format_obj': None
+                }
+            
             # Check if this run has the same formatting as current group
             if current_group['format'] is None:
-                # First run - start new group
+                # First run or new group - start it
                 current_group['runs'] = [run]
-                current_group['run_indices'] = [idx]
-                current_group['text'] = run.text  # Includes spaces!
+                current_group['run_indices'] = [i]
+                current_group['text'] = run_text  # Includes spaces!
                 current_group['format'] = format_sig
                 current_group['format_obj'] = run_format
             elif format_sig == current_group['format']:
                 # Same formatting - merge into current group
                 # CRITICAL: run.text already contains spaces, so concatenation preserves spacing
                 current_group['runs'].append(run)
-                current_group['run_indices'].append(idx)
-                current_group['text'] += run.text  # Spaces preserved automatically!
+                current_group['run_indices'].append(i)
+                current_group['text'] += run_text  # Spaces preserved automatically!
+            elif is_whitespace or is_punctuation:
+                # Whitespace/punctuation-only run with different formatting - treat as transparent
+                # Merge it into current group to preserve spacing/punctuation, but keep current formatting
+                # This allows runs with same formatting to merge across punctuation/whitespace runs
+                current_group['runs'].append(run)
+                current_group['run_indices'].append(i)
+                current_group['text'] += run_text  # Preserve the whitespace/punctuation
+                # Don't change format or format_obj - keep current group's formatting
             else:
-                # Different formatting - save current group and start new one
+                # Different formatting and not whitespace - save current group and start new one
                 merged_groups.append(current_group)
                 current_group = {
                     'runs': [run],
-                    'run_indices': [idx],
-                    'text': run.text,
+                    'run_indices': [i],
+                    'text': run_text,
                     'format': format_sig,
                     'format_obj': run_format
                 }
+            
+            i += 1
         
         # Add the last group
         if current_group['runs']:
@@ -504,8 +739,9 @@ class RobustFormatPreserver:
         if not para_data:
             return [{'text': translated_text, 'format': {}}]
         
-        # Pattern to match run markers
-        pattern = r'««RUN(\d+):[^»]+»»(.*?)««/RUN\1»»'
+        # Pattern to match run markers - CRITICAL: Use re.DOTALL to match across newlines!
+        # The ([\s\S]*?) pattern matches any character including newlines
+        pattern = r'««RUN(\d+):[^»]+»»([\s\S]*?)««/RUN\1»»'
         
         parsed_runs = []
         last_end = 0
@@ -539,13 +775,26 @@ class RobustFormatPreserver:
             original_run = next((r for r in para_data['runs'] if r['id'] == run_id), None)
             
             if original_run:
+                # Ensure format dictionary exists and is valid
+                format_dict = original_run.get('format', {})
+                if not isinstance(format_dict, dict):
+                    format_dict = {}
+                
+                # Debug: Always log format dict for runs with I marker
+                print(f"[FORMAT DEBUG] Run ID {run_id}: italic={format_dict.get('italic')}, bold={format_dict.get('bold')}")
+                if format_dict.get('italic'):
+                    print(f"[FORMAT DEBUG] Run ID {run_id} HAS ITALIC=TRUE in stored format")
+                
                 parsed_runs.append({
                     'text': run_text,
-                    'format': original_run['format'],
+                    'format': format_dict,
                     'run_id': run_id
                 })
             else:
-                # Run ID not found - shouldn't happen
+                # Run ID not found - shouldn't happen, but log it
+                print(f"[WARNING] Run ID {run_id} not found in para_data['runs'] for para_id {para_id}")
+                available_ids = [r['id'] for r in para_data.get('runs', [])]
+                print(f"[WARNING] Available run IDs: {available_ids}")
                 parsed_runs.append({
                     'text': run_text,
                     'format': {},
@@ -589,6 +838,9 @@ class RobustFormatPreserver:
     
     def apply_formatting_to_paragraph(self, para: Paragraph, para_id: int, translated_text: str):
         """Apply all formatting to translated paragraph"""
+        print(f"\n[DEBUG APPLY] Starting apply_formatting_to_paragraph for para_id={para_id}")
+        print(f"[DEBUG APPLY] Translated text preview: {translated_text[:200] if len(translated_text) > 200 else translated_text}")
+        
         # CRITICAL: Remove ALL delimiter markers first (catches any variations including translated/misspelled ones)
         # First: Remove properly closed markers <<<...>>>
         translated_text = re.sub(r'<<<[^>]*?>>>', '', translated_text, flags=re.DOTALL)
@@ -599,6 +851,11 @@ class RobustFormatPreserver:
         translated_text = re.sub(r'<<<.*?(?=\s|$)', '', translated_text, flags=re.DOTALL)
         
         para_data = self.format_map.get(para_id)
+        print(f"[DEBUG APPLY] format_map has para_id={para_id}: {para_data is not None}")
+        if para_data:
+            print(f"[DEBUG APPLY] para_data['runs'] count: {len(para_data.get('runs', []))}")
+            for run_info in para_data.get('runs', []):
+                print(f"[DEBUG APPLY]   Run ID {run_info['id']}: italic={run_info['format'].get('italic')}, bold={run_info['format'].get('bold')}")
         if not para_data:
             # No format data - remove any markers and set plain text
             clean_text = re.sub(r'««[^»]+»»', '', translated_text)
@@ -663,21 +920,61 @@ class RobustFormatPreserver:
             # Final safety check: ensure text has no markers
             clean_run_text = re.sub(r'««[^»]+»»', '', run_data.get('text', ''))
             
+            # DEBUG: Log runs that might be Roman numerals
+            stripped_before = clean_run_text.strip().upper()
+            if stripped_before in ['I', 'V', 'X', 'II', 'III', 'IV', 'VI', 'VII', 'VIII', 'IX']:
+                print(f"[ROMAN CHECK] Run {i}: '{clean_run_text}' (stripped: '{stripped_before}')")
+            
+            # Post-process: Convert any remaining Roman numerals to Arabic
+            clean_run_text_before = clean_run_text
+            clean_run_text = convert_roman_numerals_in_text(clean_run_text)
+            
+            # DEBUG: Log if conversion happened
+            if clean_run_text_before != clean_run_text:
+                print(f"[ROMAN CONVERTED] Run {i}: '{clean_run_text_before}' → '{clean_run_text}'")
+            
+            # Get format dictionary
+            fmt = run_data.get('format', {})
+            
             # Create or reuse run
             if i < len(para.runs):
                 run = para.runs[i]
                 run.text = clean_run_text
+                
+                # CRITICAL: Reset all formatting properties when reusing runs
+                # This prevents leftover formatting from affecting the new content
+                # Set to False (not None) so properties can be properly overridden
+                try:
+                    run.bold = False
+                    run.italic = False
+                    run.underline = False
+                    run.font.strike = False
+                    run.font.double_strike = False
+                    run.font.subscript = False
+                    run.font.superscript = False
+                    run.font.all_caps = False
+                    run.font.small_caps = False
+                    run.font.shadow = False
+                    run.font.emboss = False
+                    run.font.imprint = False
+                    run.font.outline = False
+                except Exception:
+                    # Some properties might not be settable, continue anyway
+                    pass
             else:
                 run = para.add_run(clean_run_text)
             
             # Apply all formatting
-            fmt = run_data.get('format', {})
+            # DEBUG: Log what we're applying
+            print(f"[DEBUG APPLY RUN {i}] fmt.get('italic')={fmt.get('italic')}, fmt.get('bold')={fmt.get('bold')}, text={clean_run_text[:30] if len(clean_run_text) > 30 else clean_run_text}")
             
-            # Basic formatting
+            # Basic formatting - only apply if value is explicitly True or False (not None)
             if fmt.get('bold') is not None:
                 run.bold = fmt['bold']
+                print(f"[DEBUG APPLY RUN {i}] Set run.bold = {fmt['bold']}")
             if fmt.get('italic') is not None:
                 run.italic = fmt['italic']
+                print(f"[DEBUG APPLY RUN {i}] Set run.italic = {fmt['italic']}")
             if fmt.get('underline') is not None:
                 run.underline = fmt['underline']
             if fmt.get('strike') is not None:
@@ -804,6 +1101,37 @@ Translate the following {len(marked_texts)} passages into {language} with ABSOLU
   * "Part III" → "Part 3"
   * "Volume XIV" → "Volume 14"
   * "Year MDCCLXXVI" → "Year 1776"
+
+**🔴 CRITICAL: STANDALONE ROMAN NUMERALS (SECTION/STANZA NUMBERS):**
+- **MOST IMPORTANT**: When you see a standalone Roman numeral on its own line or at the start of a paragraph, it is ALWAYS a section/stanza number, NOT an English letter
+- **Examples that MUST be converted:**
+  * A paragraph containing ONLY "I" → Convert to "1" (NOT the English letter "I")
+  * A paragraph containing ONLY "V" → Convert to "5" (NOT the English letter "V")
+  * A paragraph containing ONLY "X" → Convert to "10" (NOT the English letter "X")
+  * A paragraph containing ONLY "III" → Convert to "3"
+  * A paragraph containing ONLY "VII" → Convert to "7"
+- **How to recognize standalone Roman numerals:**
+  * They appear alone on their own line (preceded by newline, followed by newline)
+  * They appear at the very start of a paragraph (first thing on the line)
+  * They are NOT part of a word (like "I" in "I went to the store")
+  * They are NOT part of a sentence (like "V" in "V for Victory")
+- **When in doubt**: If a Roman numeral (I, V, X, etc.) appears standalone on its own line or at paragraph start, it's 99% likely a section number and should be converted
+- **Rule of thumb**: I, V, X alone on a line = section/stanza number = convert to 1, 5, 10
+
+**🚫 CRITICAL WARNING - DO NOT CONVERT THE ENGLISH PRONOUN "I":**
+- The letter "I" is ALSO the English first-person pronoun (meaning "me" or "myself")
+- **NEVER convert "I" to "1" when it's the English pronoun!**
+- **Examples that MUST NOT be converted:**
+  * "I thought" → KEEP as "I thought" (NOT "1 thought")
+  * "I went to the store" → KEEP as "I went to the store" (NOT "1 went to the store")
+  * "I am happy" → KEEP as "I am happy" (NOT "1 am happy")
+  * "I love you" → KEEP as "I love you" (NOT "1 love you")
+- **How to recognize the English pronoun "I":**
+  * It's followed by a verb (thought, went, am, was, have, will, etc.)
+  * It's part of a sentence, not standing alone
+  * It appears with other words in the same run/paragraph
+- **ONLY convert "I" to "1" when it's COMPLETELY STANDALONE** (the entire paragraph is just "I" with nothing else)
+
 - When translating to modern English (8th grade level), use modern Arabic numerals exclusively
 - Do NOT preserve Roman numerals in modern English translations
 - Convert ordinal Roman numerals: "1st" (not "Ist"), "2nd" (not "IInd"), "3rd" (not "IIIrd"), "4th" (not "IVth")
