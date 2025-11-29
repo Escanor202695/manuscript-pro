@@ -48,6 +48,51 @@ def _safe_float(value):
     # Handle python-docx Length objects (they have .pt property)
     if hasattr(value, 'pt'):
         return float(value.pt)
+
+
+def ensure_heading_bold(para):
+    """
+    Ensure that heading paragraphs have bold runs.
+    This is important because heading styles typically have bold by default,
+    but when text is replaced, runs might not have explicit bold formatting.
+    
+    This fixes the issue where cloned documents don't have bold headings.
+    """
+    if not para or not para.style:
+        return
+    
+    style_name = para.style.name.lower()
+    
+    # Check if this is a heading style
+    if not style_name.startswith('heading'):
+        return
+    
+    # Check if any run explicitly has bold=False (user intentionally removed bold)
+    has_explicit_non_bold = any(
+        run.bold is False for run in para.runs if run.bold is not None
+    )
+    
+    # If user explicitly removed bold, don't force it back
+    if has_explicit_non_bold:
+        return
+    
+    # Check if the heading style itself has bold enabled
+    # In Word, heading styles typically have bold by default
+    style_has_bold = True  # Default: assume headings should be bold
+    try:
+        # Try to check if the style's font has bold explicitly set
+        if hasattr(para.style, 'font') and para.style.font.bold is not None:
+            style_has_bold = para.style.font.bold
+        # If not explicitly set (None), default to True (standard Word behavior)
+    except:
+        # If we can't check, default to making headings bold (standard behavior)
+        style_has_bold = True
+    
+    # Ensure all runs are bold if style requires it
+    if style_has_bold:
+        for run in para.runs:
+            if run.bold is None or run.bold is False:
+                run.bold = True
     if isinstance(value, (int, float)):
         return float(value)
     try:
@@ -1033,6 +1078,9 @@ class RobustFormatPreserver:
         # Remove any extra empty runs
         while len(para.runs) > len(parsed_runs):
             para._p.remove(para.runs[-1]._element)
+        
+        # CRITICAL: Ensure heading paragraphs are bold (fixes issue with cloned documents)
+        ensure_heading_bold(para)
 
 
 def create_robust_translation_prompt(marked_texts: List[Tuple[int, str]], language: str) -> str:

@@ -1409,6 +1409,51 @@ def apply_font_to_run(run, font_info: Dict):
         run.font.outline = font_info['outline']
 
 
+def ensure_heading_bold(para):
+    """
+    Ensure that heading paragraphs have bold runs.
+    This is important because heading styles typically have bold by default,
+    but when text is replaced, runs might not have explicit bold formatting.
+    
+    This fixes the issue where cloned documents don't have bold headings.
+    """
+    if not para or not para.style:
+        return
+    
+    style_name = para.style.name.lower()
+    
+    # Check if this is a heading style
+    if not style_name.startswith('heading'):
+        return
+    
+    # Check if any run explicitly has bold=False (user intentionally removed bold)
+    has_explicit_non_bold = any(
+        run.bold is False for run in para.runs if run.bold is not None
+    )
+    
+    # If user explicitly removed bold, don't force it back
+    if has_explicit_non_bold:
+        return
+    
+    # Check if the heading style itself has bold enabled
+    # In Word, heading styles typically have bold by default
+    style_has_bold = True  # Default: assume headings should be bold
+    try:
+        # Try to check if the style's font has bold explicitly set
+        if hasattr(para.style, 'font') and para.style.font.bold is not None:
+            style_has_bold = para.style.font.bold
+        # If not explicitly set (None), default to True (standard Word behavior)
+    except:
+        # If we can't check, default to making headings bold (standard behavior)
+        style_has_bold = True
+    
+    # Ensure all runs are bold if style requires it
+    if style_has_bold:
+        for run in para.runs:
+            if run.bold is None or run.bold is False:
+                run.bold = True
+
+
 def apply_smart_formatting(para, translation: str, original: str):
     """
     Smart format application based on run analysis - optimized for different complexity levels.
@@ -1553,6 +1598,9 @@ def apply_smart_formatting(para, translation: str, original: str):
     # Clear any extra runs
     while len(para.runs) > len(font_runs):
         para._p.remove(para.runs[-1]._element)
+    
+    # CRITICAL: Ensure heading paragraphs are bold (fixes issue with cloned documents)
+    ensure_heading_bold(para)
     
     return  # Character-based font mapping applied - all font properties preserved
 
@@ -2179,6 +2227,9 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
                     else:
                         # No runs, add as single run
                         para.add_run(untranslated_text)
+                    
+                    # Ensure heading paragraphs are bold
+                    ensure_heading_bold(para)
                 
                 continue  # Skip to next batch
             
@@ -2230,6 +2281,9 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
                             else:
                                 # No runs, add as single run
                                 para.add_run(untranslated_text)
+                            
+                            # Ensure heading paragraphs are bold
+                            ensure_heading_bold(para)
                     else:
                         # Valid translation - apply formatting-preserved translation
                         preserver.apply_formatting_to_paragraph(para, marked_para_id, translation)
@@ -2284,6 +2338,9 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
                             else:
                                 # No runs, add as single run
                                 para.add_run(untranslated_text)
+                            
+                            # Ensure heading paragraphs are bold
+                            ensure_heading_bold(para)
                     else:
                         # Valid translation - apply normally
                         translation = sanitize_response(translation)
@@ -2311,6 +2368,9 @@ async def translate_document_content_async(file_bytes: bytes, file_name: str, la
                 else:
                     # No runs, add as single run
                     para.add_run(untranslated_text)
+                
+                # Ensure heading paragraphs are bold
+                ensure_heading_bold(para)
     
     # Log failed batches summary
     if failed_batch_count > 0:
